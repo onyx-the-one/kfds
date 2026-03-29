@@ -1,0 +1,37 @@
+# KFDS26 Main Node — sdkconfig defaults for ESP32-S3
+# Apply with: idf.py set-target esp32s3
+
+# Target
+CONFIG_IDF_TARGET="esp32s3"
+
+# Flash
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# CPU frequency
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# FreeRTOS
+CONFIG_FREERTOS_HZ=1000
+
+# SPI (both buses used: SPI2 for IMU, SPI3 for LoRa)
+CONFIG_SPI_MASTER_IN_IRAM=y
+
+# I2C (for BME688)
+# I2C driver is included by default, no special config needed
+
+# UART (UART1 for NEO-M9N at 38400 baud)
+# UART driver is included by default
+
+# Log level
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Partition table — single factory app
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
+
+# Stack overflow check
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+
+# Watchdog
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30

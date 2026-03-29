@@ -1,386 +1,395 @@
-// main.cpp
+// KFDS26 Main Node Firmware
+// FreeRTOS multi-task architecture for ESP32-S3
+//
+// Tasks:
+//   sensor_task  — BME688 + ICM-42688-P telemetry
+//   gnss_task    — NEO-M9N GNSS telemetry
+//   lora_tx_task — Dequeue frames, transmit via LoRa
+//   lora_rx_task — Listen for CMD frames, dispatch
+//   status_task  — Periodic STATUS telemetry
+
 #include <stdio.h>
 #include <string.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/i2c.h"
-#include "driver/uart.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "node_config.h"
 #include "polysense_proto.h"
+#include "bme688.h"
+#include "icm42688p.h"
+#include "neo_m9n.h"
+#include "e22_lora.h"
 
-// -------- Configuration --------
+static const char *TAG = "MAIN";
 
-// I2C (same pins as Arduino sketch)
-#define I2C_MASTER_NUM      I2C_NUM_0
-#define I2C_MASTER_SDA_IO   GPIO_NUM_5
-#define I2C_MASTER_SCL_IO   GPIO_NUM_4
-#define I2C_MASTER_FREQ_HZ  400000
+// =============================================================================
+// TX frame queue
+// =============================================================================
 
-// UART: adjust if your board uses different pins
-#define UART_PORT           UART_NUM_0
-#define UART_BAUDRATE       115200
-#define UART_TX_PIN         GPIO_NUM_43
-#define UART_RX_PIN         GPIO_NUM_44
+typedef struct {
+    uint8_t data[TX_FRAME_MAX_SIZE];
+    size_t  len;
+} tx_frame_t;
 
-// BME280 & MPU6500 I2C addresses
-#define BME280_ADDR_1       0x76
-#define BME280_ADDR_2       0x77
-#define MPU6500_ADDR        0x68
+static QueueHandle_t s_tx_queue;
 
-static const char *TAG = "POLYSENSE";
-
-// -------- I2C init --------
-
-static esp_err_t i2c_master_init()
+// Helper: build a polysense frame and enqueue it for LoRa TX
+static bool enqueue_frame(uint8_t msg_type, const uint8_t *payload, uint16_t payload_len)
 {
-    i2c_config_t conf = {};
-    conf.mode = I2C_MODE_MASTER;
-    conf.sda_io_num = I2C_MASTER_SDA_IO;
-    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.scl_io_num = I2C_MASTER_SCL_IO;
-    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.master.clk_speed = I2C_MASTER_FREQ_HZ;
-    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &conf));
-    return i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+    tx_frame_t frame;
+    frame.len = ps_build_frame(frame.data, sizeof(frame.data),
+                               NODE_ID, msg_type, payload, payload_len);
+    if (frame.len == 0) return false;
+    return xQueueSend(s_tx_queue, &frame, pdMS_TO_TICKS(10)) == pdTRUE;
 }
 
-static esp_err_t i2c_read_reg(uint8_t addr, uint8_t reg, uint8_t *data, size_t len)
+// =============================================================================
+// Mission state machine
+// =============================================================================
+
+static volatile ps_mission_state_t s_mission_state = PS_MSTATE_IDLE;
+static SemaphoreHandle_t s_state_mutex;
+
+static ps_mission_state_t get_mission_state(void)
 {
-    return i2c_master_write_read_device(
-        I2C_MASTER_NUM, addr, &reg, 1, data, len, pdMS_TO_TICKS(100)
-    );
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    ps_mission_state_t st = s_mission_state;
+    xSemaphoreGive(s_state_mutex);
+    return st;
 }
 
-static esp_err_t i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
+static void set_mission_state(ps_mission_state_t new_state)
 {
-    uint8_t buf[2] = { reg, val };
-    return i2c_master_write_to_device(
-        I2C_MASTER_NUM, addr, buf, 2, pdMS_TO_TICKS(100)
-    );
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (new_state != s_mission_state) {
+        ESP_LOGI(TAG, "Mission state: %d -> %d", s_mission_state, new_state);
+        s_mission_state = new_state;
+    }
+    xSemaphoreGive(s_state_mutex);
 }
 
-// -------- BME280 minimal driver with compensation --------
+// =============================================================================
+// Link quality cache (updated by lora_rx_task)
+// =============================================================================
 
-static uint8_t g_bme280_addr = BME280_ADDR_1;
+static e22_link_quality_t s_link_quality = {};
+static SemaphoreHandle_t  s_lq_mutex;
 
-// Calibration registers
-static uint16_t dig_T1;
-static int16_t  dig_T2, dig_T3;
-static uint16_t dig_P1;
-static int16_t  dig_P2, dig_P3, dig_P4, dig_P5, dig_P6, dig_P7, dig_P8, dig_P9;
-static uint8_t  dig_H1;
-static int16_t  dig_H2, dig_H3;
-static int16_t  dig_H4, dig_H5;
-static int8_t   dig_H6;
-static int32_t  t_fine;
-
-static bool bme280_read_calib()
+static void update_link_quality(void)
 {
-    uint8_t buf[26];
-
-    // T1..T3, P1..P9
-    if (i2c_read_reg(g_bme280_addr, 0x88, buf, 24) != ESP_OK) return false;
-
-    dig_T1 = (uint16_t)(buf[1] << 8 | buf[0]);
-    dig_T2 = (int16_t)(buf[3] << 8 | buf[2]);
-    dig_T3 = (int16_t)(buf[5] << 8 | buf[4]);
-
-    dig_P1 = (uint16_t)(buf[7] << 8 | buf[6]);
-    dig_P2 = (int16_t)(buf[9] << 8 | buf[8]);
-    dig_P3 = (int16_t)(buf[11] << 8 | buf[10]);
-    dig_P4 = (int16_t)(buf[13] << 8 | buf[12]);
-    dig_P5 = (int16_t)(buf[15] << 8 | buf[14]);
-    dig_P6 = (int16_t)(buf[17] << 8 | buf[16]);
-    dig_P7 = (int16_t)(buf[19] << 8 | buf[18]);
-    dig_P8 = (int16_t)(buf[21] << 8 | buf[20]);
-    dig_P9 = (int16_t)(buf[23] << 8 | buf[22]);
-
-    // H1
-    if (i2c_read_reg(g_bme280_addr, 0xA1, &dig_H1, 1) != ESP_OK) return false;
-
-    // H2..H6
-    uint8_t hbuf[7];
-    if (i2c_read_reg(g_bme280_addr, 0xE1, hbuf, 7) != ESP_OK) return false;
-
-    dig_H2 = (int16_t)(hbuf[1] << 8 | hbuf[0]);
-    dig_H3 = hbuf[2];
-    dig_H4 = (int16_t)((hbuf[3] << 4) | (hbuf[4] & 0x0F));
-    dig_H5 = (int16_t)((hbuf[5] << 4) | (hbuf[4] >> 4));
-    dig_H6 = (int8_t)hbuf[6];
-
-    return true;
+    e22_link_quality_t lq;
+    e22_get_link_quality(&lq);
+    xSemaphoreTake(s_lq_mutex, portMAX_DELAY);
+    s_link_quality = lq;
+    xSemaphoreGive(s_lq_mutex);
 }
 
-static int32_t bme280_compensate_T(int32_t adc_T)
+static e22_link_quality_t get_link_quality(void)
 {
-    int32_t var1  = ((((adc_T >> 3) - ((int32_t)dig_T1 << 1))) *
-                     ((int32_t)dig_T2)) >> 11;
-    int32_t var2  = (((((adc_T >> 4) - ((int32_t)dig_T1)) *
-                      ((adc_T >> 4) - ((int32_t)dig_T1))) >> 12) *
-                     ((int32_t)dig_T3)) >> 14;
-
-    t_fine = var1 + var2;
-    int32_t T  = (t_fine * 5 + 128) >> 8; // °C * 100
-    return T;
+    xSemaphoreTake(s_lq_mutex, portMAX_DELAY);
+    e22_link_quality_t lq = s_link_quality;
+    xSemaphoreGive(s_lq_mutex);
+    return lq;
 }
 
-static uint32_t bme280_compensate_P(int32_t adc_P)
+// =============================================================================
+// Uptime helper
+// =============================================================================
+
+static inline uint32_t uptime_ms(void)
 {
-    int64_t var1, var2, p;
-    var1 = ((int64_t)t_fine) - 128000;
-    var2 = var1 * var1 * (int64_t)dig_P6;
-    var2 = var2 + ((var1 * (int64_t)dig_P5) << 17);
-    var2 = var2 + (((int64_t)dig_P4) << 35);
-    var1 = ((var1 * var1 * (int64_t)dig_P3) >> 8) +
-           ((var1 * (int64_t)dig_P2) << 12);
-    var1 = (((((int64_t)1) << 47) + var1) *
-            ((int64_t)dig_P1)) >> 33;
-
-    if (var1 == 0) return 0; // avoid div by zero
-
-    p = 1048576 - adc_P;
-    p = (((p << 31) - var2) * 3125) / var1;
-    var1 = (((int64_t)dig_P9) * (p >> 13) * (p >> 13)) >> 25;
-    var2 = (((int64_t)dig_P8) * p) >> 19;
-
-    p = ((p + var1 + var2) >> 8) + (((int64_t)dig_P7) << 4);
-    return (uint32_t)p; // Pa * 256; we will divide later
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
-static uint32_t bme280_compensate_H(int32_t adc_H)
+// =============================================================================
+// sensor_task — BME688 + ICM-42688-P
+// =============================================================================
+
+static void sensor_task(void *arg)
 {
-    int32_t v_x1_u32r;
-    v_x1_u32r = t_fine - ((int32_t)76800);
-    v_x1_u32r = (((((adc_H << 14) -
-                    (((int32_t)dig_H4) << 20) -
-                    (((int32_t)dig_H5) * v_x1_u32r)) + ((int32_t)16384)) >> 15) *
-                  (((((((v_x1_u32r * ((int32_t)dig_H6)) >> 10) *
-                       (((v_x1_u32r * ((int32_t)dig_H3)) >> 11) + ((int32_t)32768))) >> 10) +
-                     ((int32_t)2097152)) * ((int32_t)dig_H2) + 8192) >> 14));
-    v_x1_u32r = (v_x1_u32r -
-                 (((((v_x1_u32r >> 15) * (v_x1_u32r >> 15)) >> 7) *
-                   ((int32_t)dig_H1)) >> 4));
-    if (v_x1_u32r < 0) v_x1_u32r = 0;
-    if (v_x1_u32r > 419430400) v_x1_u32r = 419430400;
-    return (uint32_t)(v_x1_u32r >> 12); // %RH * 1024
+    uint32_t env_sample_id = 0;
+    uint32_t imu_sample_id = 0;
+    TickType_t last_env_tick = xTaskGetTickCount();
+    TickType_t last_imu_tick = xTaskGetTickCount();
+
+    while (true) {
+        TickType_t now = xTaskGetTickCount();
+
+        // --- ENV telemetry (BME688) ---
+        if ((now - last_env_tick) * portTICK_PERIOD_MS >= ENV_INTERVAL_MS) {
+            last_env_tick = now;
+
+            bme688_data_t env_data;
+            bool env_ok = bme688_read(&env_data);
+
+            ps_env_telem_t env = {};
+            env.uptime_ms          = uptime_ms();
+            env.sample_id          = env_sample_id++;
+            env.temperature_c_x100 = env_ok ? (int16_t)(env_data.temperature_c * 100.0f) : 0;
+            env.pressure_pa        = env_ok ? (uint32_t)env_data.pressure_pa : 0;
+            env.humidity_rh_x100   = env_ok ? (uint16_t)(env_data.humidity_rh * 100.0f) : 0;
+
+            // env_flags: bit0=temp valid, bit1=press valid, bit2=hum valid, bit3=gas valid
+            env.env_flags = 0;
+            if (env_ok) {
+                env.env_flags |= 0x07; // T+P+H valid
+                if (env_data.gas_valid) env.env_flags |= 0x08;
+            }
+
+            // Pack gas resistance into reserved bytes (uint32_t, Ohms)
+            if (env_ok && env_data.gas_valid) {
+                uint32_t gas_ohm = (uint32_t)env_data.gas_resistance;
+                memcpy(env.reserved, &gas_ohm, sizeof(gas_ohm));
+            }
+
+            enqueue_frame(PS_MSG_ENV_TELEM, (const uint8_t *)&env, sizeof(env));
+        }
+
+        // --- IMU telemetry (ICM-42688-P) ---
+        if ((now - last_imu_tick) * portTICK_PERIOD_MS >= IMU_INTERVAL_MS) {
+            last_imu_tick = now;
+
+            icm42688p_data_t imu_data;
+            bool imu_ok = icm42688p_read(&imu_data);
+
+            ps_imu_telem_t imu = {};
+            imu.uptime_ms     = uptime_ms();
+            imu.sample_id     = imu_sample_id++;
+            imu.ax_mps2_x1000 = imu_ok ? (int16_t)(imu_data.ax * 1000.0f) : 0;
+            imu.ay_mps2_x1000 = imu_ok ? (int16_t)(imu_data.ay * 1000.0f) : 0;
+            imu.az_mps2_x1000 = imu_ok ? (int16_t)(imu_data.az * 1000.0f) : 0;
+            imu.gx_dps_x1000  = imu_ok ? (int16_t)(imu_data.gx * 1000.0f) : 0;
+            imu.gy_dps_x1000  = imu_ok ? (int16_t)(imu_data.gy * 1000.0f) : 0;
+            imu.gz_dps_x1000  = imu_ok ? (int16_t)(imu_data.gz * 1000.0f) : 0;
+
+            // imu_flags: bit0=accel valid, bit1=gyro valid
+            imu.imu_flags = imu_ok ? 0x03 : 0x00;
+
+            enqueue_frame(PS_MSG_IMU_TELEM, (const uint8_t *)&imu, sizeof(imu));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5)); // Yield between checks
+    }
 }
 
-static bool bme280_detect_and_init()
-{
-    uint8_t id = 0;
-    uint8_t reg = 0xD0;
+// =============================================================================
+// gnss_task — NEO-M9N GNSS telemetry
+// =============================================================================
 
-    if (i2c_master_write_read_device(
-            I2C_MASTER_NUM, BME280_ADDR_1, &reg, 1,
-            &id, 1, pdMS_TO_TICKS(100)) == ESP_OK && id == 0x60) {
-        g_bme280_addr = BME280_ADDR_1;
-    } else if (i2c_master_write_read_device(
-                   I2C_MASTER_NUM, BME280_ADDR_2, &reg, 1,
-                   &id, 1, pdMS_TO_TICKS(100)) == ESP_OK && id == 0x60) {
-        g_bme280_addr = BME280_ADDR_2;
-    } else {
-        ESP_LOGE(TAG, "BME280 not found");
-        return false;
+static void gnss_task(void *arg)
+{
+    uint32_t gps_sample_id = 0;
+
+    while (true) {
+        gnss_fix_t fix;
+        neo_m9n_get_fix(&fix);
+
+        ps_gps_telem_t gps = {};
+        gps.uptime_ms          = uptime_ms();
+        gps.sample_id          = gps_sample_id++;
+        gps.lat_deg_x1e7       = fix.lat_deg_x1e7;
+        gps.lon_deg_x1e7       = fix.lon_deg_x1e7;
+        gps.alt_m_x100         = fix.alt_m_x100;
+        gps.ground_speed_cmps  = fix.ground_speed_cmps;
+        gps.course_deg_x100    = fix.course_deg_x100;
+        gps.hdop_x100          = fix.hdop_x100;
+        gps.sat_count          = fix.sat_count;
+        gps.fix_type           = fix.fix_type;
+
+        // gps_flags: bit0=fix valid
+        gps.gps_flags = fix.valid ? 0x01 : 0x00;
+
+        enqueue_frame(PS_MSG_GPS_TELEM, (const uint8_t *)&gps, sizeof(gps));
+
+        vTaskDelay(pdMS_TO_TICKS(GPS_INTERVAL_MS));
+    }
+}
+
+// =============================================================================
+// lora_tx_task — Dequeue frames and transmit via LoRa
+// =============================================================================
+
+static void lora_tx_task(void *arg)
+{
+    tx_frame_t frame;
+
+    while (true) {
+        if (xQueueReceive(s_tx_queue, &frame, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (!e22_transmit(frame.data, frame.len)) {
+                ESP_LOGW(TAG, "LoRa TX failed (len=%d)", (int)frame.len);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// lora_rx_task — Listen for CMD frames, dispatch
+// =============================================================================
+
+static void handle_command(const ps_header_t *hdr, const uint8_t *payload)
+{
+    if (hdr->len < sizeof(ps_cmd_hdr_t)) return;
+
+    const ps_cmd_hdr_t *cmd = (const ps_cmd_hdr_t *)payload;
+    ESP_LOGI(TAG, "CMD received: id=%u class=%u code=0x%02X",
+             cmd->cmd_id, cmd->cmd_class, cmd->cmd_code);
+
+    // Build ACK
+    ps_cmd_ack_t ack = {};
+    ack.cmd_id       = cmd->cmd_id;
+    ack.timestamp_ms = uptime_ms();
+
+    switch (cmd->cmd_class) {
+    case PS_CMD_CLASS_MISSION:
+        if (cmd->cmd_code == 0x01 && cmd->param_len >= 1) {
+            // MISSION_SET_STATE
+            const ps_cmd_mission_set_state_t *p =
+                (const ps_cmd_mission_set_state_t *)(payload + sizeof(ps_cmd_hdr_t));
+            if (p->mission_state <= PS_MSTATE_RECOVERY) {
+                set_mission_state((ps_mission_state_t)p->mission_state);
+                ack.status = PS_CMD_STATUS_DONE;
+            } else {
+                ack.status = PS_CMD_STATUS_REJECTED_INVALID;
+            }
+        } else if (cmd->cmd_code == 0x02 && cmd->param_len >= sizeof(ps_cmd_mission_set_rates_t)) {
+            // MISSION_SET_RATES — acknowledge but rates are compile-time for now
+            ack.status = PS_CMD_STATUS_ACCEPTED;
+        } else {
+            ack.status = PS_CMD_STATUS_REJECTED_INVALID;
+        }
+        break;
+
+    case PS_CMD_CLASS_RECOVERY:
+        ack.status = PS_CMD_STATUS_ACCEPTED;
+        break;
+
+    case PS_CMD_CLASS_MOTOR:
+        ack.status = PS_CMD_STATUS_ACCEPTED;
+        break;
+
+    case PS_CMD_CLASS_CONFIG:
+        ack.status = PS_CMD_STATUS_ACCEPTED;
+        break;
+
+    default:
+        ack.status = PS_CMD_STATUS_REJECTED_INVALID;
+        break;
     }
 
-    // Reset
-    i2c_write_reg(g_bme280_addr, 0xE0, 0xB6);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    enqueue_frame(PS_MSG_CMD_ACK, (const uint8_t *)&ack, sizeof(ack));
+}
 
-    if (!bme280_read_calib()) {
-        ESP_LOGE(TAG, "BME280 calib read failed");
-        return false;
+static void lora_rx_task(void *arg)
+{
+    e22_start_rx();
+
+    uint8_t rx_buf[256];
+    ps_parser_t parser;
+    ps_parser_init(&parser);
+
+    ps_header_t hdr;
+    uint8_t payload_buf[128];
+
+    while (true) {
+        size_t rx_len = e22_receive(rx_buf, sizeof(rx_buf));
+        if (rx_len > 0) {
+            update_link_quality();
+
+            // Feed bytes into protocol parser
+            for (size_t i = 0; i < rx_len; i++) {
+                if (ps_parser_feed(&parser, rx_buf[i], &hdr, payload_buf, sizeof(payload_buf))) {
+                    if (hdr.msg_type == PS_MSG_CMD) {
+                        handle_command(&hdr, payload_buf);
+                    }
+                }
+            }
+
+            // Re-enter RX mode after processing
+            e22_start_rx();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-
-    // ctrl_hum: oversampling x1
-    i2c_write_reg(g_bme280_addr, 0xF2, 0x01);
-    // ctrl_meas: temp x1, pressure x1, normal mode (0b00100111)
-    i2c_write_reg(g_bme280_addr, 0xF4, 0x27);
-    // config: standby 0.5ms, filter off
-    i2c_write_reg(g_bme280_addr, 0xF5, 0x00);
-
-    ESP_LOGI(TAG, "BME280 at 0x%02X", g_bme280_addr);
-    return true;
 }
 
-static bool bme280_read(float *T_c, float *P_pa, float *H_rh)
+// =============================================================================
+// status_task — Periodic STATUS telemetry
+// =============================================================================
+
+static void status_task(void *arg)
 {
-    uint8_t data[8];
-    if (i2c_read_reg(g_bme280_addr, 0xF7, data, 8) != ESP_OK) return false;
+    while (true) {
+        e22_link_quality_t lq = get_link_quality();
 
-    int32_t adc_P = (int32_t)(((uint32_t)data[0] << 12) |
-                              ((uint32_t)data[1] << 4) |
-                              ((uint32_t)data[2] >> 4));
-    int32_t adc_T = (int32_t)(((uint32_t)data[3] << 12) |
-                              ((uint32_t)data[4] << 4) |
-                              ((uint32_t)data[5] >> 4));
-    int32_t adc_H = (int32_t)(((uint32_t)data[6] << 8) | data[7]);
+        ps_status_t status = {};
+        status.uptime_ms        = uptime_ms();
+        status.battery_mv       = 0;     // placeholder — no ADC configured yet
+        status.battery_pct_x100 = 0;
+        status.storage_free_kb  = 0;     // placeholder
+        status.mission_state    = (uint8_t)get_mission_state();
+        status.recovery_flags   = 0;
+        status.link_rssi_dbm    = lq.rssi_dbm;
+        status.link_snr_db_x10  = lq.snr_db_x10;
+        status.status_flags     = 0;
 
-    if (adc_T == 0x800000 || adc_P == 0x800000 || adc_H == 0x8000) return false;
+        enqueue_frame(PS_MSG_STATUS, (const uint8_t *)&status, sizeof(status));
 
-    int32_t T_x100 = bme280_compensate_T(adc_T);
-    uint32_t P_raw = bme280_compensate_P(adc_P);  // Pa * 256
-    uint32_t H_raw = bme280_compensate_H(adc_H);  // %RH * 1024
-
-    *T_c  = T_x100 / 100.0f;
-    *P_pa = (float)P_raw / 256.0f;
-    *H_rh = (float)H_raw / 1024.0f;
-    return true;
+        vTaskDelay(pdMS_TO_TICKS(STATUS_INTERVAL_MS));
+    }
 }
 
-// -------- MPU6500 minimal driver --------
-
-static esp_err_t mpu6500_init()
-{
-    uint8_t buf[2];
-
-    // Wake, PLL with X gyro
-    buf[0] = 0x6B; buf[1] = 0x01;
-    if (i2c_master_write_to_device(I2C_MASTER_NUM, MPU6500_ADDR,
-                                   buf, 2, pdMS_TO_TICKS(100)) != ESP_OK)
-        return ESP_FAIL;
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // Gyro: ±2000 dps
-    buf[0] = 0x1B; buf[1] = 0x18;
-    i2c_master_write_to_device(I2C_MASTER_NUM, MPU6500_ADDR,
-                               buf, 2, pdMS_TO_TICKS(100));
-    // Accel: ±16 g
-    buf[0] = 0x1C; buf[1] = 0x18;
-    i2c_master_write_to_device(I2C_MASTER_NUM, MPU6500_ADDR,
-                               buf, 2, pdMS_TO_TICKS(100));
-
-    ESP_LOGI(TAG, "MPU6500 init done");
-    return ESP_OK;
-}
-
-static bool mpu6500_read(float *ax, float *ay, float *az,
-                         float *gx, float *gy, float *gz)
-{
-    uint8_t buf[14];
-    uint8_t reg = 0x3B;
-    if (i2c_master_write_read_device(
-            I2C_MASTER_NUM, MPU6500_ADDR, &reg, 1,
-            buf, 14, pdMS_TO_TICKS(100)) != ESP_OK)
-        return false;
-
-    int16_t ax_raw = (int16_t)((buf[0] << 8) | buf[1]);
-    int16_t ay_raw = (int16_t)((buf[2] << 8) | buf[3]);
-    int16_t az_raw = (int16_t)((buf[4] << 8) | buf[5]);
-    int16_t gx_raw = (int16_t)((buf[8] << 8) | buf[9]);
-    int16_t gy_raw = (int16_t)((buf[10] << 8) | buf[11]);
-    int16_t gz_raw = (int16_t)((buf[12] << 8) | buf[13]);
-
-    const float accel_sens = 1.0f / 2048.0f; // 16g
-    const float gyro_sens  = 1.0f / 16.4f;   // 2000 dps
-
-    *ax = ax_raw * accel_sens * 9.80665f;
-    *ay = ay_raw * accel_sens * 9.80665f;
-    *az = az_raw * accel_sens * 9.80665f;
-
-    *gx = gx_raw * gyro_sens;
-    *gy = gy_raw * gyro_sens;
-    *gz = gz_raw * gyro_sens;
-
-    return true;
-}
-
-// -------- UART ------
-
-static void uart_init()
-{
-    uart_config_t uart_config;
-    memset(&uart_config, 0, sizeof(uart_config));  // ensure all fields = 0
-
-    uart_config.baud_rate = UART_BAUDRATE;
-    uart_config.data_bits = UART_DATA_8_BITS;
-    uart_config.parity    = UART_PARITY_DISABLE;
-    uart_config.stop_bits = UART_STOP_BITS_1;
-    uart_config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
-    uart_config.source_clk= UART_SCLK_DEFAULT;
-    // rx_flow_ctrl_thresh, flags, backup_before_sleep all remain 0
-
-    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, 2048, 2048, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(UART_PORT, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_PORT, UART_TX_PIN, UART_RX_PIN,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-}
-
-// -------- Main loop --------
-
-static uint32_t env_sample_id = 0;
-static uint32_t imu_sample_id = 0;
+// =============================================================================
+// app_main — Initialize hardware and start tasks
+// =============================================================================
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "PolySense backup node starting");
+    ESP_LOGI(TAG, "=== KFDS26 Main Node Starting ===");
+    ESP_LOGI(TAG, "Node ID: %d", NODE_ID);
 
-    ESP_ERROR_CHECK(i2c_master_init());
-    bme280_detect_and_init();
-    mpu6500_init();
-    uart_init();
+    // Create synchronization primitives
+    s_tx_queue   = xQueueCreate(TX_QUEUE_LEN, sizeof(tx_frame_t));
+    s_state_mutex = xSemaphoreCreateMutex();
+    s_lq_mutex    = xSemaphoreCreateMutex();
 
-    const uint8_t node_id = 1;
-    uint8_t tx_buf[128];
-
-    while (true) {
-        uint32_t uptime_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-
-        // ENV_TELEM
-        float T_c = 0.0f, P_pa = 0.0f, H_rh = 0.0f;
-        bool env_ok = bme280_read(&T_c, &P_pa, &H_rh);
-
-        ps_env_telem_t env = {};
-        env.uptime_ms          = uptime_ms;
-        env.sample_id          = env_sample_id++;
-        env.temperature_c_x100 = (int16_t)(T_c * 100.0f);
-        env.pressure_pa        = (uint32_t)P_pa;
-        env.humidity_rh_x100   = (uint16_t)(H_rh * 100.0f);
-        env.env_flags          = 0;
-        if (env_ok) {
-            env.env_flags |= (1 << 0) | (1 << 1) | (1 << 2);
-        }
-
-        size_t env_len = ps_build_frame(
-            tx_buf, sizeof(tx_buf),
-            node_id,
-            PS_MSG_ENV_TELEM,
-            (const uint8_t *)&env,
-            sizeof(env)
-        );
-        if (env_len > 0) {
-            uart_write_bytes(UART_PORT, (const char *)tx_buf, env_len);
-        }
-
-        // IMU_TELEM
-        float ax=0, ay=0, az=0, gx=0, gy=0, gz=0;
-        bool imu_ok = mpu6500_read(&ax, &ay, &az, &gx, &gy, &gz);
-
-        ps_imu_telem_t imu = {};
-        imu.uptime_ms       = uptime_ms;
-        imu.sample_id       = imu_sample_id++;
-        imu.ax_mps2_x1000   = (int16_t)(ax * 1000.0f);
-        imu.ay_mps2_x1000   = (int16_t)(ay * 1000.0f);
-        imu.az_mps2_x1000   = (int16_t)(az * 1000.0f);
-        imu.gx_dps_x1000    = (int16_t)(gx * 1000.0f);
-        imu.gy_dps_x1000    = (int16_t)(gy * 1000.0f);
-        imu.gz_dps_x1000    = (int16_t)(gz * 1000.0f);
-        imu.imu_flags       = imu_ok ? ((1 << 0) | (1 << 1)) : 0;
-
-        size_t imu_len = ps_build_frame(
-            tx_buf, sizeof(tx_buf),
-            node_id,
-            PS_MSG_IMU_TELEM,
-            (const uint8_t *)&imu,
-            sizeof(imu)
-        );
-        if (imu_len > 0) {
-            uart_write_bytes(UART_PORT, (const char *)tx_buf, imu_len);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(200)); // ~5 Hz
+    if (!s_tx_queue || !s_state_mutex || !s_lq_mutex) {
+        ESP_LOGE(TAG, "Failed to create RTOS primitives");
+        return;
     }
+
+    // Initialize drivers
+    ESP_LOGI(TAG, "Initializing BME688...");
+    bool bme_ok = bme688_init();
+    if (!bme_ok) ESP_LOGW(TAG, "BME688 init failed — ENV telemetry disabled");
+
+    ESP_LOGI(TAG, "Initializing ICM-42688-P...");
+    bool imu_ok = icm42688p_init();
+    if (!imu_ok) ESP_LOGW(TAG, "ICM-42688-P init failed — IMU telemetry disabled");
+
+    ESP_LOGI(TAG, "Initializing NEO-M9N GNSS...");
+    bool gnss_ok = neo_m9n_init();
+    if (!gnss_ok) ESP_LOGW(TAG, "NEO-M9N init failed — GPS telemetry disabled");
+
+    ESP_LOGI(TAG, "Initializing E22 LoRa...");
+    bool lora_ok = e22_init();
+    if (!lora_ok) {
+        ESP_LOGE(TAG, "E22 LoRa init failed — cannot transmit");
+        return;
+    }
+
+    // Start tasks
+    xTaskCreate(sensor_task,  "sensor",   TASK_STACK_SENSOR,  NULL, TASK_PRIO_SENSOR,  NULL);
+    xTaskCreate(gnss_task,    "gnss",     TASK_STACK_GNSS,    NULL, TASK_PRIO_GNSS,    NULL);
+    xTaskCreate(lora_tx_task, "lora_tx",  TASK_STACK_LORA_TX, NULL, TASK_PRIO_LORA_TX, NULL);
+    xTaskCreate(lora_rx_task, "lora_rx",  TASK_STACK_LORA_RX, NULL, TASK_PRIO_LORA_RX, NULL);
+    xTaskCreate(status_task,  "status",   TASK_STACK_STATUS,  NULL, TASK_PRIO_STATUS,  NULL);
+
+    ESP_LOGI(TAG, "All tasks started. Mission state: IDLE");
 }
