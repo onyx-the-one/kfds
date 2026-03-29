@@ -52,7 +52,7 @@ static spi_device_handle_t s_spi = NULL;
 
 static esp_err_t spi_write_reg(uint8_t reg, uint8_t val)
 {
-    uint8_t tx[2] = { reg & 0x7F, val };
+    uint8_t tx[2] = { static_cast<uint8_t>(reg & 0x7F), val };
     spi_transaction_t t = {};
     t.length = 16;
     t.tx_buffer = tx;
@@ -61,7 +61,7 @@ static esp_err_t spi_write_reg(uint8_t reg, uint8_t val)
 
 static esp_err_t spi_read_reg(uint8_t reg, uint8_t *val)
 {
-    uint8_t tx[2] = { reg | SPI_READ, 0x00 };
+    uint8_t tx[2] = { static_cast<uint8_t>(reg | SPI_READ), 0x00 };
     uint8_t rx[2] = {};
     spi_transaction_t t = {};
     t.length = 16;
