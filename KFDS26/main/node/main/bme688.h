@@ -1,7 +1,7 @@
 #pragma once
 
-#include <stdbool.h>
-#include <stdint.h>
+#include "driver/spi_master.h"
+#include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,13 +16,12 @@ typedef struct {
     bool  gas_valid;        // true if gas measurement completed
 } bme688_data_t;
 
-// Initialize I2C bus and detect BME688 (scans 0x76 then 0x77).
-// Returns true on success.
-bool bme688_init(void);
+// Initialize BME688 on the shared SPI bus.
+// Do NOT call spi_bus_initialize() — only spi_bus_add_device().
+esp_err_t bme688_init(spi_host_device_t host);
 
-// Read compensated T, P, H, and gas resistance.
-// Returns true on success.
-bool bme688_read(bme688_data_t *data);
+// Read compensated T, P, H, and gas resistance (forced mode).
+esp_err_t bme688_read(bme688_data_t *data);
 
 #ifdef __cplusplus
 }

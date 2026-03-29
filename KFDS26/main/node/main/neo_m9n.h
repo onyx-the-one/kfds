@@ -1,5 +1,8 @@
 #pragma once
 
+#include "driver/spi_master.h"
+#include "esp_err.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -37,13 +40,13 @@ typedef struct {
     uint32_t last_update_ms;    // uptime when last fix was received
 } gnss_fix_t;
 
-// Initialize UART and start NMEA parsing.
-// Returns true on success.
-bool neo_m9n_init(void);
+// Initialize NEO-M9N on the shared SPI bus and start the polling task.
+// Do NOT call spi_bus_initialize() — only spi_bus_add_device().
+esp_err_t neo_m9n_init(spi_host_device_t host);
 
 // Get a copy of the latest GNSS fix (thread-safe).
-// Returns true if a valid fix is available.
-bool neo_m9n_get_fix(gnss_fix_t *fix);
+// Returns ESP_OK if a valid fix is available.
+esp_err_t neo_m9n_get_fix(gnss_fix_t *fix);
 
 #ifdef __cplusplus
 }

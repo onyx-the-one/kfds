@@ -1,7 +1,7 @@
 #include "e22_lora.h"
 #include "node_config.h"
 
-#include <string.h>
+#include <cstring>
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -57,16 +57,13 @@ static const char *TAG = "E22_LORA";
 // SX1262 register for sync word
 #define REG_LORA_SYNC_WORD_MSB          0x0740
 
-// TX timeout: 10 seconds in 15.625 µs steps
-#define TX_TIMEOUT_10S                  640000
-
 // RX continuous
 #define RX_CONTINUOUS                   0xFFFFFF
 
 // -----------------------------------------------------------------------------
 // SPI handle and state
 // -----------------------------------------------------------------------------
-static spi_device_handle_t s_spi = NULL;
+static spi_device_handle_t s_spi = nullptr;
 static e22_link_quality_t  s_last_lq = {};
 
 // -----------------------------------------------------------------------------
@@ -74,7 +71,7 @@ static e22_link_quality_t  s_last_lq = {};
 // -----------------------------------------------------------------------------
 static void wait_busy(void)
 {
-    while (gpio_get_level((gpio_num_t)LORA_PIN_BUSY)) {
+    while (gpio_get_level(PIN_LORA_BUSY)) {
         vTaskDelay(1);
     }
 }
@@ -108,7 +105,7 @@ static esp_err_t sx_cmd(const uint8_t *cmd, size_t cmd_len,
 
 static esp_err_t sx_cmd_no_resp(const uint8_t *cmd, size_t len)
 {
-    return sx_cmd(cmd, len, NULL, 0);
+    return sx_cmd(cmd, len, nullptr, 0);
 }
 
 static void sx_set_standby(uint8_t mode)
@@ -121,8 +118,8 @@ static void sx_write_register(uint16_t addr, const uint8_t *data, size_t len)
 {
     uint8_t cmd[3 + len];
     cmd[0] = SX_CMD_WRITE_REGISTER;
-    cmd[1] = (addr >> 8) & 0xFF;
-    cmd[2] = addr & 0xFF;
+    cmd[1] = static_cast<uint8_t>((addr >> 8) & 0xFF);
+    cmd[2] = static_cast<uint8_t>(addr & 0xFF);
     memcpy(cmd + 3, data, len);
     sx_cmd_no_resp(cmd, 3 + len);
 }
@@ -144,14 +141,13 @@ static void sx_read_buffer(uint8_t offset, uint8_t *data, size_t len)
 
 static void sx_set_rf_frequency(uint32_t freq_hz)
 {
-    // freq_reg = freq_hz * 2^25 / 32e6
     uint32_t freq_reg = (uint32_t)((uint64_t)freq_hz * (1ULL << 25) / 32000000ULL);
     uint8_t cmd[] = {
         SX_CMD_SET_RF_FREQUENCY,
-        (uint8_t)((freq_reg >> 24) & 0xFF),
-        (uint8_t)((freq_reg >> 16) & 0xFF),
-        (uint8_t)((freq_reg >> 8) & 0xFF),
-        (uint8_t)(freq_reg & 0xFF)
+        static_cast<uint8_t>((freq_reg >> 24) & 0xFF),
+        static_cast<uint8_t>((freq_reg >> 16) & 0xFF),
+        static_cast<uint8_t>((freq_reg >> 8) & 0xFF),
+        static_cast<uint8_t>(freq_reg & 0xFF)
     };
     sx_cmd_no_resp(cmd, sizeof(cmd));
 }
@@ -162,8 +158,6 @@ static void sx_set_packet_type(uint8_t type)
     sx_cmd_no_resp(cmd, sizeof(cmd));
 }
 
-// SF: 5-12, BW: 0=7.8k,1=10.4k,...,4=31.25k,5=62.5k,6=125k,7=250k,8=500k
-// CR: 1=4/5, 2=4/6, 3=4/7, 4=4/8
 static uint8_t bw_to_sx(uint32_t bw_hz)
 {
     if (bw_hz <= 7800)   return 0x00;
@@ -181,11 +175,10 @@ static uint8_t bw_to_sx(uint32_t bw_hz)
 static void sx_set_modulation_params(uint8_t sf, uint32_t bw_hz, uint8_t cr)
 {
     uint8_t bw = bw_to_sx(bw_hz);
-    // LowDataRateOptimize: enable if symbol time > 16ms
     uint8_t ldro = 0;
     if (sf >= 11 && bw <= 0x04) ldro = 1;
 
-    uint8_t cmd[] = { SX_CMD_SET_MODULATION_PARAMS, sf, bw, (uint8_t)(cr - 4), ldro };
+    uint8_t cmd[] = { SX_CMD_SET_MODULATION_PARAMS, sf, bw, static_cast<uint8_t>(cr - 4), ldro };
     sx_cmd_no_resp(cmd, sizeof(cmd));
 }
 
@@ -194,19 +187,19 @@ static void sx_set_packet_params(uint16_t preamble, bool implicit_header,
 {
     uint8_t cmd[] = {
         SX_CMD_SET_PACKET_PARAMS,
-        (uint8_t)((preamble >> 8) & 0xFF),
-        (uint8_t)(preamble & 0xFF),
-        implicit_header ? (uint8_t)0x01 : (uint8_t)0x00,
+        static_cast<uint8_t>((preamble >> 8) & 0xFF),
+        static_cast<uint8_t>(preamble & 0xFF),
+        implicit_header ? static_cast<uint8_t>(0x01) : static_cast<uint8_t>(0x00),
         payload_len,
-        crc_on ? (uint8_t)0x01 : (uint8_t)0x00,
-        invert_iq ? (uint8_t)0x01 : (uint8_t)0x00
+        crc_on ? static_cast<uint8_t>(0x01) : static_cast<uint8_t>(0x00),
+        invert_iq ? static_cast<uint8_t>(0x01) : static_cast<uint8_t>(0x00)
     };
     sx_cmd_no_resp(cmd, sizeof(cmd));
 }
 
 static void sx_set_tx_params(int8_t power_dbm, uint8_t ramp_time)
 {
-    uint8_t cmd[] = { SX_CMD_SET_TX_PARAMS, (uint8_t)power_dbm, ramp_time };
+    uint8_t cmd[] = { SX_CMD_SET_TX_PARAMS, static_cast<uint8_t>(power_dbm), ramp_time };
     sx_cmd_no_resp(cmd, sizeof(cmd));
 }
 
@@ -227,10 +220,10 @@ static void sx_set_dio_irq_params(uint16_t irq_mask, uint16_t dio1_mask,
 {
     uint8_t cmd[] = {
         SX_CMD_SET_DIO_IRQ_PARAMS,
-        (uint8_t)(irq_mask >> 8), (uint8_t)(irq_mask),
-        (uint8_t)(dio1_mask >> 8), (uint8_t)(dio1_mask),
-        (uint8_t)(dio2_mask >> 8), (uint8_t)(dio2_mask),
-        (uint8_t)(dio3_mask >> 8), (uint8_t)(dio3_mask)
+        static_cast<uint8_t>(irq_mask >> 8), static_cast<uint8_t>(irq_mask),
+        static_cast<uint8_t>(dio1_mask >> 8), static_cast<uint8_t>(dio1_mask),
+        static_cast<uint8_t>(dio2_mask >> 8), static_cast<uint8_t>(dio2_mask),
+        static_cast<uint8_t>(dio3_mask >> 8), static_cast<uint8_t>(dio3_mask)
     };
     sx_cmd_no_resp(cmd, sizeof(cmd));
 }
@@ -240,24 +233,23 @@ static uint16_t sx_get_irq_status(void)
     uint8_t cmd[] = { SX_CMD_GET_IRQ_STATUS, 0x00 };
     uint8_t resp[2] = {};
     sx_cmd(cmd, sizeof(cmd), resp, 2);
-    return ((uint16_t)resp[0] << 8) | resp[1];
+    return (static_cast<uint16_t>(resp[0]) << 8) | resp[1];
 }
 
 static void sx_clear_irq(uint16_t mask)
 {
-    uint8_t cmd[] = { SX_CMD_CLEAR_IRQ_STATUS, (uint8_t)(mask >> 8), (uint8_t)(mask) };
+    uint8_t cmd[] = { SX_CMD_CLEAR_IRQ_STATUS, static_cast<uint8_t>(mask >> 8), static_cast<uint8_t>(mask) };
     sx_cmd_no_resp(cmd, sizeof(cmd));
 }
 
 static void sx_set_tx(uint32_t timeout_us)
 {
-    // Timeout in 15.625µs steps
     uint32_t to = (timeout_us * 64) / 1000;
     uint8_t cmd[] = {
         SX_CMD_SET_TX,
-        (uint8_t)((to >> 16) & 0xFF),
-        (uint8_t)((to >> 8) & 0xFF),
-        (uint8_t)(to & 0xFF)
+        static_cast<uint8_t>((to >> 16) & 0xFF),
+        static_cast<uint8_t>((to >> 8) & 0xFF),
+        static_cast<uint8_t>(to & 0xFF)
     };
     sx_cmd_no_resp(cmd, sizeof(cmd));
 }
@@ -266,16 +258,16 @@ static void sx_set_rx(uint32_t timeout_code)
 {
     uint8_t cmd[] = {
         SX_CMD_SET_RX,
-        (uint8_t)((timeout_code >> 16) & 0xFF),
-        (uint8_t)((timeout_code >> 8) & 0xFF),
-        (uint8_t)(timeout_code & 0xFF)
+        static_cast<uint8_t>((timeout_code >> 16) & 0xFF),
+        static_cast<uint8_t>((timeout_code >> 8) & 0xFF),
+        static_cast<uint8_t>(timeout_code & 0xFF)
     };
     sx_cmd_no_resp(cmd, sizeof(cmd));
 }
 
 static void sx_set_dio2_as_rf_switch(bool enable)
 {
-    uint8_t cmd[] = { SX_CMD_SET_DIO2_AS_RF_SWITCH, enable ? (uint8_t)0x01 : (uint8_t)0x00 };
+    uint8_t cmd[] = { SX_CMD_SET_DIO2_AS_RF_SWITCH, enable ? static_cast<uint8_t>(0x01) : static_cast<uint8_t>(0x00) };
     sx_cmd_no_resp(cmd, sizeof(cmd));
 }
 
@@ -283,41 +275,26 @@ static void sx_set_dio2_as_rf_switch(bool enable)
 // Public API
 // -----------------------------------------------------------------------------
 
-bool e22_init(void)
+esp_err_t e22_lora_init(spi_host_device_t host)
 {
-    // Initialize SPI bus
-    spi_bus_config_t bus_cfg = {};
-    bus_cfg.mosi_io_num = LORA_SPI_MOSI;
-    bus_cfg.miso_io_num = LORA_SPI_MISO;
-    bus_cfg.sclk_io_num = LORA_SPI_SCLK;
-    bus_cfg.quadwp_io_num = -1;
-    bus_cfg.quadhd_io_num = -1;
-    bus_cfg.max_transfer_sz = 256 + 16;
-
-    esp_err_t err = spi_bus_initialize(LORA_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    // Add SPI device — SX1262 uses CPOL=0, CPHA=0 (mode 0)
+    // Add E22 to the shared SPI bus — SX1262 uses Mode 0 (CPOL=0, CPHA=0)
     spi_device_interface_config_t dev_cfg = {};
-    dev_cfg.clock_speed_hz = 8 * 1000 * 1000; // 8 MHz
+    dev_cfg.clock_speed_hz = SPI_CLK_LORA;
     dev_cfg.mode = 0;
-    dev_cfg.spics_io_num = LORA_SPI_CS;
+    dev_cfg.spics_io_num = PIN_CS_LORA;
     dev_cfg.queue_size = 4;
 
-    err = spi_bus_add_device(LORA_SPI_HOST, &dev_cfg, &s_spi);
+    esp_err_t err = spi_bus_add_device(host, &dev_cfg, &s_spi);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "SPI add device failed: %s", esp_err_to_name(err));
-        return false;
+        return err;
     }
 
     // Configure GPIO pins
     gpio_config_t io_conf = {};
 
     // BUSY pin — input
-    io_conf.pin_bit_mask = (1ULL << LORA_PIN_BUSY);
+    io_conf.pin_bit_mask = (1ULL << PIN_LORA_BUSY);
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
@@ -325,18 +302,18 @@ bool e22_init(void)
     gpio_config(&io_conf);
 
     // DIO1 pin — input
-    io_conf.pin_bit_mask = (1ULL << LORA_PIN_DIO1);
+    io_conf.pin_bit_mask = (1ULL << PIN_LORA_DIO1);
     gpio_config(&io_conf);
 
     // RST pin — output
-    io_conf.pin_bit_mask = (1ULL << LORA_PIN_RST);
+    io_conf.pin_bit_mask = (1ULL << PIN_LORA_RST);
     io_conf.mode = GPIO_MODE_OUTPUT;
     gpio_config(&io_conf);
 
     // Hardware reset
-    gpio_set_level((gpio_num_t)LORA_PIN_RST, 0);
+    gpio_set_level(PIN_LORA_RST, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level((gpio_num_t)LORA_PIN_RST, 1);
+    gpio_set_level(PIN_LORA_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(20));
 
     // Wait for BUSY to go low
@@ -368,8 +345,8 @@ bool e22_init(void)
 
     // Set sync word (LoRa private network)
     uint8_t sw[2] = {
-        (uint8_t)((LORA_SYNC_WORD & 0xF0) | 0x04),
-        (uint8_t)(((LORA_SYNC_WORD & 0x0F) << 4) | 0x04)
+        static_cast<uint8_t>((LORA_SYNC_WORD & 0xF0) | 0x04),
+        static_cast<uint8_t>(((LORA_SYNC_WORD & 0x0F) << 4) | 0x04)
     };
     sx_write_register(REG_LORA_SYNC_WORD_MSB, sw, 2);
 
@@ -387,17 +364,17 @@ bool e22_init(void)
     ESP_LOGI(TAG, "E22 (SX1262) initialized: %lu Hz, SF%d, BW%lu, CR4/%d, %d dBm",
              (unsigned long)LORA_FREQUENCY_HZ, LORA_SF,
              (unsigned long)LORA_BW, LORA_CR, LORA_TX_POWER_DBM);
-    return true;
+    return ESP_OK;
 }
 
-bool e22_transmit(const uint8_t *data, size_t len)
+esp_err_t e22_transmit(const uint8_t *data, size_t len)
 {
-    if (!data || len == 0 || len > 255 || !s_spi) return false;
+    if (!data || len == 0 || len > 255 || !s_spi) return ESP_ERR_INVALID_ARG;
 
     sx_set_standby(STDBY_RC);
 
     // Update packet params with actual payload length
-    sx_set_packet_params(LORA_PREAMBLE_LEN, false, (uint8_t)len, true, false);
+    sx_set_packet_params(LORA_PREAMBLE_LEN, false, static_cast<uint8_t>(len), true, false);
 
     // Write payload to FIFO
     sx_write_buffer(0x00, data, len);
@@ -408,34 +385,34 @@ bool e22_transmit(const uint8_t *data, size_t len)
     // Start TX with 10 second timeout
     sx_set_tx(10000000); // 10s in µs
 
-    // Wait for TX done or timeout (poll DIO1 or IRQ status)
+    // Wait for TX done or timeout
     uint32_t start = (uint32_t)(esp_timer_get_time() / 1000ULL);
     while (true) {
         uint16_t irq = sx_get_irq_status();
         if (irq & IRQ_TX_DONE) {
             sx_clear_irq(IRQ_ALL);
-            return true;
+            return ESP_OK;
         }
         if (irq & IRQ_TIMEOUT) {
             ESP_LOGW(TAG, "TX timeout");
             sx_clear_irq(IRQ_ALL);
             sx_set_standby(STDBY_RC);
-            return false;
+            return ESP_ERR_TIMEOUT;
         }
 
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
         if (now - start > 12000) {
             ESP_LOGE(TAG, "TX hard timeout");
             sx_set_standby(STDBY_RC);
-            return false;
+            return ESP_ERR_TIMEOUT;
         }
         vTaskDelay(1);
     }
 }
 
-bool e22_start_rx(void)
+esp_err_t e22_start_rx(void)
 {
-    if (!s_spi) return false;
+    if (!s_spi) return ESP_ERR_INVALID_STATE;
 
     sx_set_standby(STDBY_RC);
     sx_clear_irq(IRQ_ALL);
@@ -445,15 +422,17 @@ bool e22_start_rx(void)
 
     // Continuous RX
     sx_set_rx(RX_CONTINUOUS);
-    return true;
+    return ESP_OK;
 }
 
-size_t e22_receive(uint8_t *buf, size_t buf_size)
+esp_err_t e22_receive(uint8_t *buf, size_t buf_size, size_t *out_len)
 {
-    if (!buf || buf_size == 0 || !s_spi) return 0;
+    if (!buf || buf_size == 0 || !out_len || !s_spi) return ESP_ERR_INVALID_ARG;
+
+    *out_len = 0;
 
     uint16_t irq = sx_get_irq_status();
-    if (!(irq & IRQ_RX_DONE)) return 0;
+    if (!(irq & IRQ_RX_DONE)) return ESP_ERR_NOT_FOUND;
 
     sx_clear_irq(IRQ_ALL);
 
@@ -465,7 +444,7 @@ size_t e22_receive(uint8_t *buf, size_t buf_size)
     uint8_t payload_len = status_resp[0];
     uint8_t rx_start    = status_resp[1];
 
-    if (payload_len == 0 || payload_len > buf_size) return 0;
+    if (payload_len == 0 || payload_len > buf_size) return ESP_ERR_INVALID_SIZE;
 
     // Read payload
     sx_read_buffer(rx_start, buf, payload_len);
@@ -479,7 +458,8 @@ size_t e22_receive(uint8_t *buf, size_t buf_size)
     s_last_lq.snr_db_x10   = ((int8_t)pkt_resp[1]) * 10 / 4;
     s_last_lq.rssi_inst_dbm = -(int16_t)pkt_resp[2] / 2;
 
-    return payload_len;
+    *out_len = payload_len;
+    return ESP_OK;
 }
 
 void e22_get_link_quality(e22_link_quality_t *lq)

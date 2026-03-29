@@ -8,8 +8,8 @@
 //   lora_rx_task — Listen for CMD frames, dispatch
 //   status_task  — Periodic STATUS telemetry
 
-#include <stdio.h>
-#include <string.h>
+#include <cstdio>
+#include <cstring>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +19,7 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "driver/spi_master.h"
 
 #include "node_config.h"
 #include "polysense_proto.h"
@@ -127,7 +128,7 @@ static void sensor_task(void *arg)
             last_env_tick = now;
 
             bme688_data_t env_data;
-            bool env_ok = bme688_read(&env_data);
+            bool env_ok = (bme688_read(&env_data) == ESP_OK);
 
             ps_env_telem_t env = {};
             env.uptime_ms          = uptime_ms();
@@ -157,7 +158,7 @@ static void sensor_task(void *arg)
             last_imu_tick = now;
 
             icm42688p_data_t imu_data;
-            bool imu_ok = icm42688p_read(&imu_data);
+            bool imu_ok = (icm42688p_read(&imu_data) == ESP_OK);
 
             ps_imu_telem_t imu = {};
             imu.uptime_ms     = uptime_ms();
@@ -222,7 +223,7 @@ static void lora_tx_task(void *arg)
 
     while (true) {
         if (xQueueReceive(s_tx_queue, &frame, pdMS_TO_TICKS(100)) == pdTRUE) {
-            if (!e22_transmit(frame.data, frame.len)) {
+            if (e22_transmit(frame.data, frame.len) != ESP_OK) {
                 ESP_LOGW(TAG, "LoRa TX failed (len=%d)", (int)frame.len);
             }
         }
@@ -298,8 +299,9 @@ static void lora_rx_task(void *arg)
     uint8_t payload_buf[128];
 
     while (true) {
-        size_t rx_len = e22_receive(rx_buf, sizeof(rx_buf));
-        if (rx_len > 0) {
+        size_t rx_len = 0;
+        esp_err_t rx_err = e22_receive(rx_buf, sizeof(rx_buf), &rx_len);
+        if (rx_err == ESP_OK && rx_len > 0) {
             update_link_quality();
 
             // Feed bytes into protocol parser
@@ -346,7 +348,7 @@ static void status_task(void *arg)
 }
 
 // =============================================================================
-// app_main — Initialize hardware and start tasks
+// app_main — Initialize shared SPI bus and start tasks
 // =============================================================================
 
 extern "C" void app_main(void)
@@ -364,21 +366,34 @@ extern "C" void app_main(void)
         return;
     }
 
-    // Initialize drivers
+    // Initialize shared SPI bus (SPI2_HOST) — all 4 devices share this bus
+    spi_bus_config_t bus_cfg = {};
+    bus_cfg.mosi_io_num = PIN_SPI_MOSI;
+    bus_cfg.miso_io_num = PIN_SPI_MISO;
+    bus_cfg.sclk_io_num = PIN_SPI_SCLK;
+    bus_cfg.quadwp_io_num = -1;
+    bus_cfg.quadhd_io_num = -1;
+    bus_cfg.max_transfer_sz = 4096;
+    bus_cfg.flags = 0;
+
+    ESP_LOGI(TAG, "Initializing shared SPI bus (SPI2_HOST)...");
+    ESP_ERROR_CHECK(spi_bus_initialize(POLYSENSE_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+
+    // Initialize drivers — each adds itself to the shared bus
     ESP_LOGI(TAG, "Initializing BME688...");
-    bool bme_ok = bme688_init();
+    bool bme_ok = (bme688_init(POLYSENSE_SPI_HOST) == ESP_OK);
     if (!bme_ok) ESP_LOGW(TAG, "BME688 init failed — ENV telemetry disabled");
 
     ESP_LOGI(TAG, "Initializing ICM-42688-P...");
-    bool imu_ok = icm42688p_init();
+    bool imu_ok = (icm42688p_init(POLYSENSE_SPI_HOST) == ESP_OK);
     if (!imu_ok) ESP_LOGW(TAG, "ICM-42688-P init failed — IMU telemetry disabled");
 
     ESP_LOGI(TAG, "Initializing NEO-M9N GNSS...");
-    bool gnss_ok = neo_m9n_init();
+    bool gnss_ok = (neo_m9n_init(POLYSENSE_SPI_HOST) == ESP_OK);
     if (!gnss_ok) ESP_LOGW(TAG, "NEO-M9N init failed — GPS telemetry disabled");
 
     ESP_LOGI(TAG, "Initializing E22 LoRa...");
-    bool lora_ok = e22_init();
+    bool lora_ok = (e22_lora_init(POLYSENSE_SPI_HOST) == ESP_OK);
     if (!lora_ok) {
         ESP_LOGE(TAG, "E22 LoRa init failed — cannot transmit");
         return;

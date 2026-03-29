@@ -1,9 +1,9 @@
 #include "bme688.h"
 #include "node_config.h"
 
-#include <string.h>
-#include <math.h>
-#include "driver/i2c.h"
+#include <cstring>
+#include <cmath>
+#include "driver/spi_master.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -34,11 +34,6 @@ static const char *TAG = "BME688";
 #define REG_GAS_WAIT_0          0x64
 #define REG_CTRL_GAS_1          0x71
 
-// Calibration register ranges
-#define REG_CALIB_T_P_START     0x88    // T1-T3, P1-P9 (0x88..0xA1)
-#define REG_CALIB_H1_H2_START   0xE1    // H calibration (0xE1..0xE7)
-#define REG_CALIB_H3_GAS_START  0x00    // Additional calib (0x00..0x04)
-
 // Chip ID
 #define BME688_CHIP_ID          0x61
 
@@ -49,6 +44,59 @@ static const char *TAG = "BME688";
 
 // Mode
 #define MODE_FORCED             0x01
+
+// -----------------------------------------------------------------------------
+// SPI handle
+// -----------------------------------------------------------------------------
+static spi_device_handle_t s_spi = nullptr;
+
+// -----------------------------------------------------------------------------
+// SPI helpers — BME688 SPI protocol:
+//   Write: bit 7 = 0 (addr & 0x7F), then data byte(s)
+//   Read:  bit 7 = 1 (addr | 0x80), then read byte(s)
+// -----------------------------------------------------------------------------
+static esp_err_t spi_write_reg(uint8_t reg, uint8_t val)
+{
+    uint8_t tx[2] = { static_cast<uint8_t>(reg & 0x7F), val };
+    spi_transaction_t t = {};
+    t.length = 16;
+    t.tx_buffer = tx;
+    return spi_device_transmit(s_spi, &t);
+}
+
+static esp_err_t spi_read_reg(uint8_t reg, uint8_t *val)
+{
+    uint8_t tx[2] = { static_cast<uint8_t>(reg | 0x80), 0x00 };
+    uint8_t rx[2] = {};
+    spi_transaction_t t = {};
+    t.length = 16;
+    t.tx_buffer = tx;
+    t.rx_buffer = rx;
+    esp_err_t err = spi_device_transmit(s_spi, &t);
+    if (err == ESP_OK) *val = rx[1];
+    return err;
+}
+
+static esp_err_t spi_read_buf(uint8_t reg, uint8_t *buf, size_t len)
+{
+    uint8_t tx[1 + len];
+    memset(tx, 0, sizeof(tx));
+    tx[0] = static_cast<uint8_t>(reg | 0x80);
+
+    uint8_t rx[1 + len];
+    memset(rx, 0, sizeof(rx));
+
+    spi_transaction_t t = {};
+    t.length = (1 + len) * 8;
+    t.tx_buffer = tx;
+    t.rx_buffer = rx;
+
+    esp_err_t err = spi_device_transmit(s_spi, &t);
+    if (err == ESP_OK) {
+        memcpy(buf, rx + 1, len);
+    }
+    return err;
+}
 
 // -----------------------------------------------------------------------------
 // Calibration data
@@ -91,36 +139,19 @@ static struct {
 } s_calib;
 
 static int32_t s_t_fine;
-static uint8_t s_addr;
-
-// -----------------------------------------------------------------------------
-// I2C helpers
-// -----------------------------------------------------------------------------
-static esp_err_t i2c_read_reg(uint8_t addr, uint8_t reg, uint8_t *data, size_t len)
-{
-    return i2c_master_write_read_device(
-        I2C_MASTER_NUM, addr, &reg, 1, data, len, pdMS_TO_TICKS(100));
-}
-
-static esp_err_t i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
-{
-    uint8_t buf[2] = { reg, val };
-    return i2c_master_write_to_device(
-        I2C_MASTER_NUM, addr, buf, 2, pdMS_TO_TICKS(100));
-}
 
 // -----------------------------------------------------------------------------
 // Read calibration data from BME688
 // -----------------------------------------------------------------------------
 static bool read_calibration(void)
 {
-    uint8_t coeff1[25]; // 0x88 - 0xA0 (25 bytes for T/P)
+    uint8_t coeff1[25]; // 0x89 - 0xA1 (25 bytes for T/P)
     uint8_t coeff2[16]; // 0xE1 - 0xF0 (16 bytes for H + gas)
     uint8_t coeff3[5];  // 0x00 - 0x04
 
-    if (i2c_read_reg(s_addr, 0x89, coeff1, 25) != ESP_OK) return false;
-    if (i2c_read_reg(s_addr, 0xE1, coeff2, 16) != ESP_OK) return false;
-    if (i2c_read_reg(s_addr, 0x00, coeff3, 5) != ESP_OK) return false;
+    if (spi_read_buf(0x89, coeff1, 25) != ESP_OK) return false;
+    if (spi_read_buf(0xE1, coeff2, 16) != ESP_OK) return false;
+    if (spi_read_buf(0x00, coeff3, 5) != ESP_OK) return false;
 
     // Temperature
     s_calib.t1 = (uint16_t)((coeff2[9] << 8) | coeff2[8]);
@@ -155,13 +186,13 @@ static bool read_calibration(void)
 
     // Additional gas calibration
     uint8_t tmp;
-    i2c_read_reg(s_addr, 0x02, &tmp, 1);
+    spi_read_reg(0x02, &tmp);
     s_calib.res_heat_range = (tmp >> 4) & 0x03;
 
-    i2c_read_reg(s_addr, 0x00, &tmp, 1);
+    spi_read_reg(0x00, &tmp);
     s_calib.res_heat_val = (int8_t)tmp;
 
-    i2c_read_reg(s_addr, 0x04, &tmp, 1);
+    spi_read_reg(0x04, &tmp);
     s_calib.range_sw_err = (int8_t)((tmp & 0xF0) >> 4);
 
     return true;
@@ -223,7 +254,6 @@ static float compensate_humidity(uint16_t adc_hum, float temp_comp)
 
 static float calc_gas_resistance(uint16_t gas_adc, uint8_t gas_range)
 {
-    // Lookup table for gas range constants (from Bosch datasheet)
     static const float lookup_k1[16] = {
         0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1.0f, 0.0f, -0.8f,
         0.0f, 0.0f, -0.2f, -0.5f, 0.0f, -1.0f, 0.0f, 0.0f
@@ -254,106 +284,96 @@ static uint8_t calc_res_heat(uint16_t target_temp_c)
     float res_heat = 3.4f * ((var5 * (4.0f / (4.0f + (float)s_calib.res_heat_range))
                                * (1.0f / (1.0f + ((float)s_calib.res_heat_val * 0.002f))))
                               - 25.0f);
-    return (uint8_t)res_heat;
+    return static_cast<uint8_t>(res_heat);
 }
 
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
 
-bool bme688_init(void)
+esp_err_t bme688_init(spi_host_device_t host)
 {
-    // Initialize I2C bus
-    i2c_config_t conf = {};
-    conf.mode = I2C_MODE_MASTER;
-    conf.sda_io_num = I2C_MASTER_SDA_IO;
-    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.scl_io_num = I2C_MASTER_SCL_IO;
-    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.master.clk_speed = I2C_MASTER_FREQ_HZ;
+    // Add BME688 to the shared SPI bus — Mode 0 (CPOL=0, CPHA=0)
+    spi_device_interface_config_t dev_cfg = {};
+    dev_cfg.clock_speed_hz = SPI_CLK_ENV;
+    dev_cfg.mode = 0;
+    dev_cfg.spics_io_num = PIN_CS_ENV;
+    dev_cfg.queue_size = 4;
 
-    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
+    esp_err_t err = spi_bus_add_device(host, &dev_cfg, &s_spi);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "I2C param config failed: %s", esp_err_to_name(err));
-        return false;
-    }
-    err = i2c_driver_install(I2C_MASTER_NUM, I2C_MODE_MASTER, 0, 0, 0);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        // ESP_ERR_INVALID_STATE means driver already installed
-        ESP_LOGE(TAG, "I2C driver install failed: %s", esp_err_to_name(err));
-        return false;
+        ESP_LOGE(TAG, "SPI add device failed: %s", esp_err_to_name(err));
+        return err;
     }
 
-    // Detect chip: try primary, then secondary address
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // Read and verify chip ID
     uint8_t chip_id = 0;
-    if (i2c_read_reg(BME688_ADDR_PRIMARY, REG_CHIP_ID, &chip_id, 1) == ESP_OK
-        && chip_id == BME688_CHIP_ID) {
-        s_addr = BME688_ADDR_PRIMARY;
-    } else if (i2c_read_reg(BME688_ADDR_SECONDARY, REG_CHIP_ID, &chip_id, 1) == ESP_OK
-               && chip_id == BME688_CHIP_ID) {
-        s_addr = BME688_ADDR_SECONDARY;
-    } else {
+    err = spi_read_reg(REG_CHIP_ID, &chip_id);
+    if (err != ESP_OK || chip_id != BME688_CHIP_ID) {
         ESP_LOGE(TAG, "BME688 not found (chip_id=0x%02X)", chip_id);
-        return false;
+        return ESP_ERR_NOT_FOUND;
     }
-    ESP_LOGI(TAG, "BME688 detected at 0x%02X", s_addr);
+    ESP_LOGI(TAG, "BME688 detected (chip_id=0x%02X)", chip_id);
 
     // Soft reset
-    i2c_write_reg(s_addr, REG_RESET, 0xB6);
+    spi_write_reg(REG_RESET, 0xB6);
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // Read calibration
     if (!read_calibration()) {
         ESP_LOGE(TAG, "Failed to read calibration data");
-        return false;
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
     // Configure gas heater: 300°C target, 100ms wait
     uint8_t res_heat = calc_res_heat(300);
-    i2c_write_reg(s_addr, REG_RES_HEAT_0, res_heat);
-    i2c_write_reg(s_addr, REG_GAS_WAIT_0, 0x59); // 100ms (0x59 = 100ms encoded)
+    spi_write_reg(REG_RES_HEAT_0, res_heat);
+    spi_write_reg(REG_GAS_WAIT_0, 0x59); // 100ms encoded
 
     // Enable gas measurement, use heater profile 0
     // ctrl_gas_1: run_gas=1 (bit 4), nb_conv=0 (bits 3:0)
-    i2c_write_reg(s_addr, REG_CTRL_GAS_1, 0x10);
+    spi_write_reg(REG_CTRL_GAS_1, 0x10);
 
     // Humidity oversampling x1
-    i2c_write_reg(s_addr, REG_CTRL_HUM, OSR_1X);
+    spi_write_reg(REG_CTRL_HUM, OSR_1X);
 
     // config: IIR filter off
-    i2c_write_reg(s_addr, REG_CONFIG, 0x00);
+    spi_write_reg(REG_CONFIG, 0x00);
 
     ESP_LOGI(TAG, "BME688 initialized with gas heater at 300°C");
-    return true;
+    return ESP_OK;
 }
 
-bool bme688_read(bme688_data_t *data)
+esp_err_t bme688_read(bme688_data_t *data)
 {
-    if (!data) return false;
+    if (!data || !s_spi) return ESP_ERR_INVALID_ARG;
 
     // Trigger forced measurement: temp x2, pressure x4, forced mode
     // ctrl_meas: osrs_t[7:5]=010(x2), osrs_p[4:2]=011(x4), mode[1:0]=01(forced)
-    i2c_write_reg(s_addr, REG_CTRL_MEAS, (OSR_2X << 5) | (OSR_4X << 2) | MODE_FORCED);
+    spi_write_reg(REG_CTRL_MEAS, static_cast<uint8_t>((OSR_2X << 5) | (OSR_4X << 2) | MODE_FORCED));
 
     // Wait for measurement to complete (T+P+H+gas ≈ 200ms with gas heater)
     vTaskDelay(pdMS_TO_TICKS(200));
 
     // Check measurement status
     uint8_t status;
-    i2c_read_reg(s_addr, REG_MEAS_STATUS_0, &status, 1);
+    spi_read_reg(REG_MEAS_STATUS_0, &status);
     bool new_data = (status & 0x80) != 0;
 
     if (!new_data) {
         // Retry once after short delay
         vTaskDelay(pdMS_TO_TICKS(50));
-        i2c_read_reg(s_addr, REG_MEAS_STATUS_0, &status, 1);
+        spi_read_reg(REG_MEAS_STATUS_0, &status);
         new_data = (status & 0x80) != 0;
-        if (!new_data) return false;
+        if (!new_data) return ESP_ERR_TIMEOUT;
     }
 
     // Read raw data (pressure: 3 bytes, temp: 3 bytes, humidity: 2 bytes)
     uint8_t buf[8];
-    if (i2c_read_reg(s_addr, REG_PRESS_MSB, buf, 8) != ESP_OK) return false;
+    esp_err_t err = spi_read_buf(REG_PRESS_MSB, buf, 8);
+    if (err != ESP_OK) return err;
 
     uint32_t adc_press = ((uint32_t)buf[0] << 12) | ((uint32_t)buf[1] << 4) | (buf[2] >> 4);
     uint32_t adc_temp  = ((uint32_t)buf[3] << 12) | ((uint32_t)buf[4] << 4) | (buf[5] >> 4);
@@ -361,7 +381,7 @@ bool bme688_read(bme688_data_t *data)
 
     // Read gas resistance
     uint8_t gas_buf[2];
-    i2c_read_reg(s_addr, REG_GAS_R_MSB, gas_buf, 2);
+    spi_read_buf(REG_GAS_R_MSB, gas_buf, 2);
     uint16_t gas_adc  = ((uint16_t)gas_buf[0] << 2) | (gas_buf[1] >> 6);
     uint8_t gas_range  = gas_buf[1] & 0x0F;
     bool gas_valid     = (gas_buf[1] & 0x20) != 0;  // gas_valid_r bit
@@ -380,5 +400,5 @@ bool bme688_read(bme688_data_t *data)
         data->gas_valid = false;
     }
 
-    return true;
+    return ESP_OK;
 }

@@ -1,7 +1,7 @@
 #include "icm42688p.h"
 #include "node_config.h"
 
-#include <string.h>
+#include <cstring>
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -48,7 +48,7 @@ static const char *TAG = "ICM42688P";
 // -----------------------------------------------------------------------------
 // SPI handle
 // -----------------------------------------------------------------------------
-static spi_device_handle_t s_spi = NULL;
+static spi_device_handle_t s_spi = nullptr;
 
 static esp_err_t spi_write_reg(uint8_t reg, uint8_t val)
 {
@@ -76,7 +76,7 @@ static esp_err_t spi_read_buf(uint8_t reg, uint8_t *buf, size_t len)
 {
     uint8_t tx[1 + len];
     memset(tx, 0, sizeof(tx));
-    tx[0] = reg | SPI_READ;
+    tx[0] = static_cast<uint8_t>(reg | SPI_READ);
 
     uint8_t rx[1 + len];
     memset(rx, 0, sizeof(rx));
@@ -93,43 +93,29 @@ static esp_err_t spi_read_buf(uint8_t reg, uint8_t *buf, size_t len)
     return err;
 }
 
-bool icm42688p_init(void)
+esp_err_t icm42688p_init(spi_host_device_t host)
 {
-    // Initialize SPI bus
-    spi_bus_config_t bus_cfg = {};
-    bus_cfg.mosi_io_num = IMU_SPI_MOSI;
-    bus_cfg.miso_io_num = IMU_SPI_MISO;
-    bus_cfg.sclk_io_num = IMU_SPI_SCLK;
-    bus_cfg.quadwp_io_num = -1;
-    bus_cfg.quadhd_io_num = -1;
-    bus_cfg.max_transfer_sz = 64;
-
-    esp_err_t err = spi_bus_initialize(IMU_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    // Add device — SPI mode 0, clock per config
+    // Add ICM-42688-P to the shared SPI bus — Mode 0 (CPOL=0, CPHA=0)
     spi_device_interface_config_t dev_cfg = {};
-    dev_cfg.clock_speed_hz = IMU_SPI_CLOCK_HZ;
+    dev_cfg.clock_speed_hz = SPI_CLK_IMU;
     dev_cfg.mode = 0;
-    dev_cfg.spics_io_num = IMU_SPI_CS;
+    dev_cfg.spics_io_num = PIN_CS_IMU;
     dev_cfg.queue_size = 4;
 
-    err = spi_bus_add_device(IMU_SPI_HOST, &dev_cfg, &s_spi);
+    esp_err_t err = spi_bus_add_device(host, &dev_cfg, &s_spi);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "SPI add device failed: %s", esp_err_to_name(err));
-        return false;
+        return err;
     }
 
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // Check WHO_AM_I
     uint8_t who = 0;
-    if (spi_read_reg(REG_WHO_AM_I, &who) != ESP_OK || who != WHO_AM_I_VALUE) {
+    err = spi_read_reg(REG_WHO_AM_I, &who);
+    if (err != ESP_OK || who != WHO_AM_I_VALUE) {
         ESP_LOGE(TAG, "WHO_AM_I mismatch: got 0x%02X, expected 0x%02X", who, WHO_AM_I_VALUE);
-        return false;
+        return ESP_ERR_NOT_FOUND;
     }
     ESP_LOGI(TAG, "ICM-42688-P detected (WHO_AM_I=0x%02X)", who);
 
@@ -147,23 +133,21 @@ bool icm42688p_init(void)
     spi_write_reg(REG_ACCEL_CONFIG0, ACCEL_FS_16G_1KHZ);
 
     // Enable accel + gyro in low-noise mode
-    spi_write_reg(REG_PWR_MGMT0, PWR_GYRO_LN | PWR_ACCEL_LN);
+    spi_write_reg(REG_PWR_MGMT0, static_cast<uint8_t>(PWR_GYRO_LN | PWR_ACCEL_LN));
     vTaskDelay(pdMS_TO_TICKS(1));
 
     ESP_LOGI(TAG, "ICM-42688-P initialized: ±16g, ±2000dps, 1kHz ODR");
-    return true;
+    return ESP_OK;
 }
 
-bool icm42688p_read(icm42688p_data_t *data)
+esp_err_t icm42688p_read(icm42688p_data_t *data)
 {
-    if (!data || !s_spi) return false;
+    if (!data || !s_spi) return ESP_ERR_INVALID_ARG;
 
-    // Read 12 bytes: accel XYZ (6) starting at 0x1F, then gyro XYZ (6) at 0x25
-    // They are contiguous: 0x1F-0x24 (accel), 0x25-0x2A (gyro)
+    // Read 12 bytes: accel XYZ (6) + gyro XYZ (6), contiguous from 0x1F
     uint8_t buf[12];
-    if (spi_read_buf(REG_ACCEL_DATA_X1, buf, 12) != ESP_OK) {
-        return false;
-    }
+    esp_err_t err = spi_read_buf(REG_ACCEL_DATA_X1, buf, 12);
+    if (err != ESP_OK) return err;
 
     // Data is big-endian 16-bit signed
     int16_t ax_raw = (int16_t)((buf[0] << 8) | buf[1]);
@@ -181,5 +165,5 @@ bool icm42688p_read(icm42688p_data_t *data)
     data->gy = gy_raw / GYRO_SENSITIVITY;
     data->gz = gz_raw / GYRO_SENSITIVITY;
 
-    return true;
+    return ESP_OK;
 }
