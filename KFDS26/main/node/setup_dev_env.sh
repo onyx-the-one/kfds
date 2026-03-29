@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # KFDS26 Main Node — Development Environment Setup
-# Target: Debian 13 (Trixie) with ESP-IDF v5.4 for ESP32-S3
+# Target: openSUSE Tumbleweed with ESP-IDF v5.4 for ESP32-S3
 set -euo pipefail
 
 ESP_IDF_VERSION="v5.4"
@@ -8,29 +8,31 @@ ESP_IDF_DIR="$HOME/esp/esp-idf"
 TARGET_CHIP="esp32s3"
 
 echo "=== KFDS26 Dev Environment Setup ==="
+echo "Distro:          openSUSE Tumbleweed"
 echo "ESP-IDF version: $ESP_IDF_VERSION"
 echo "Target chip:     $TARGET_CHIP"
 echo ""
 
 # ---- 1. System prerequisites ----
-echo "[1/5] Installing system prerequisites..."
-sudo apt-get update
-sudo apt-get install -y \
+echo "[1/6] Installing system prerequisites..."
+sudo zypper refresh
+sudo zypper install -y \
     git wget curl \
-    cmake ninja-build \
-    python3 python3-pip python3-venv \
-    libffi-dev libssl-dev \
+    cmake ninja \
+    python3 python3-pip python3-virtualenv \
+    libffi-devel libopenssl-devel \
     dfu-util \
-    libusb-1.0-0 \
-    gcc g++ \
+    libusb-1_0-devel \
+    gcc gcc-c++ \
     flex bison gperf \
     ccache \
-    picocom
+    picocom \
+    python3-devel
 
 echo "  System packages installed."
 
 # ---- 2. Clone ESP-IDF ----
-echo "[2/5] Setting up ESP-IDF..."
+echo "[2/6] Setting up ESP-IDF..."
 if [ -d "$ESP_IDF_DIR" ]; then
     echo "  ESP-IDF directory already exists at $ESP_IDF_DIR"
     cd "$ESP_IDF_DIR"
@@ -48,14 +50,14 @@ else
 fi
 
 # ---- 3. Install ESP-IDF toolchain for ESP32-S3 ----
-echo "[3/5] Installing ESP-IDF toolchain for $TARGET_CHIP..."
+echo "[3/6] Installing ESP-IDF toolchain for $TARGET_CHIP..."
 cd "$ESP_IDF_DIR"
 ./install.sh "$TARGET_CHIP"
 echo "  Toolchain installed."
 
 # ---- 4. Create convenience source script ----
 EXPORT_SCRIPT="$HOME/esp/source_idf.sh"
-echo "[4/5] Creating convenience script: $EXPORT_SCRIPT"
+echo "[4/6] Creating convenience script: $EXPORT_SCRIPT"
 cat > "$EXPORT_SCRIPT" << 'INNEREOF'
 #!/usr/bin/env bash
 # Source this file to set up ESP-IDF environment:
