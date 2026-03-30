@@ -24,7 +24,12 @@ typedef enum {
     PS_MSG_BEACON     = 0x05,
 
     PS_MSG_CMD        = 0x10,
-    PS_MSG_CMD_ACK    = 0x11
+    PS_MSG_CMD_ACK    = 0x11,
+
+    PS_MSG_QKD_INITIATE = 0x20,
+    PS_MSG_QKD_RESPONSE = 0x21,
+    PS_MSG_QKD_SIFTED   = 0x22,
+    PS_MSG_QKD_VERIFY   = 0x23
 } ps_msg_type_t;
 
 // Command classes
@@ -44,6 +49,11 @@ typedef enum {
     PS_MSTATE_LANDED    = 4,
     PS_MSTATE_RECOVERY  = 5
 } ps_mission_state_t;
+
+// Bit manipulation macros for packed bit arrays (MSB first)
+#define BIT_GET(arr, i)  (((arr)[(i)/8] >> (7 - ((i) % 8))) & 1)
+#define BIT_SET(arr, i)  ((arr)[(i)/8] |= (0x80 >> ((i) % 8)))
+#define BIT_CLR(arr, i)  ((arr)[(i)/8] &= ~(0x80 >> ((i) % 8)))
 
 // CRC16-CCITT parameters (0x1021 poly, 0xFFFF init)
 uint16_t ps_crc16_ccitt(const uint8_t *data, size_t len);
@@ -207,6 +217,39 @@ size_t ps_build_frame(uint8_t *dst,
                       uint8_t  msg_type,
                       const uint8_t *payload,
                       uint16_t payload_len);
+
+// ----------------------
+// QKD (BB84) payloads
+// ----------------------
+
+typedef struct __attribute__((packed)) {
+    uint8_t raw_bits[13];    // 100 bits packed, MSB first
+    uint8_t gs_bases[13];    // 100 bases packed, same format
+    uint8_t num_bits;        // = 100
+} ps_qkd_initiate_t;        // 27 bytes
+
+typedef struct __attribute__((packed)) {
+    uint8_t sat_bases[13];   // 100 satellite bases, packed
+    uint8_t num_bits;        // = 100
+} ps_qkd_response_t;        // 14 bytes
+
+typedef struct __attribute__((packed)) {
+    uint8_t match_mask[13];  // 100 bits: 1 = bases matched
+    uint8_t check_mask[13];  // 100 bits: 1 = sacrificed for error check
+    uint8_t check_bits[13];  // 100 bits: GS's bit values (check positions)
+    uint8_t num_bits;        // = 100
+} ps_qkd_sifted_t;          // 40 bytes
+
+#define QKD_PROOF_MSG_MAX 32
+
+typedef struct __attribute__((packed)) {
+    uint8_t error_count;                      // check bit mismatches (should be 0)
+    uint8_t check_count;                      // how many bits were checked
+    uint8_t key_len_bits;                     // final usable key length in bits
+    uint8_t encrypted_msg[QKD_PROOF_MSG_MAX]; // XOR-encrypted proof message
+    uint8_t encrypted_len;                    // length of encrypted message bytes
+    uint8_t status;                           // 0 = success, 1 = error check failed
+} ps_qkd_verify_t;                           // 36 bytes
 
 // Minimal streaming parser state (for optional use on ESP)
 typedef struct {

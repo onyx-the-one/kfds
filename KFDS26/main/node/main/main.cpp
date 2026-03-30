@@ -19,6 +19,7 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "driver/spi_master.h"
 
 #include "node_config.h"
@@ -287,6 +288,152 @@ static void handle_command(const ps_header_t *hdr, const uint8_t *payload)
     enqueue_frame(PS_MSG_CMD_ACK, (const uint8_t *)&ack, sizeof(ack));
 }
 
+// =============================================================================
+// BB84 QKD session state
+// =============================================================================
+
+static uint8_t s_sat_bases[13];
+static uint8_t s_measured_bits[13];
+static bool    s_qkd_session_active = false;
+
+static const char QKD_PROOF_MESSAGE[] = "KFDS26 su najlepsi";
+
+static void handle_qkd_initiate(const ps_header_t *hdr, const uint8_t *payload)
+{
+    if (hdr->len < sizeof(ps_qkd_initiate_t)) {
+        ESP_LOGW(TAG, "QKD_INITIATE too short (%u < %u)",
+                 hdr->len, (unsigned)sizeof(ps_qkd_initiate_t));
+        return;
+    }
+
+    const ps_qkd_initiate_t *init = (const ps_qkd_initiate_t *)payload;
+    uint8_t num_bits = init->num_bits;
+    if (num_bits > 100) num_bits = 100;
+
+    ESP_LOGI(TAG, "QKD_INITIATE received: %u bits", num_bits);
+
+    // Clear state
+    memset(s_sat_bases, 0, sizeof(s_sat_bases));
+    memset(s_measured_bits, 0, sizeof(s_measured_bits));
+
+    // Generate random satellite bases and simulate measurement
+    for (int i = 0; i < num_bits; i++) {
+        uint8_t sat_basis = static_cast<uint8_t>(esp_random() & 1);
+        if (sat_basis) {
+            BIT_SET(s_sat_bases, i);
+        }
+
+        uint8_t gs_basis = BIT_GET(init->gs_bases, i);
+        uint8_t raw_bit  = BIT_GET(init->raw_bits, i);
+
+        uint8_t measured;
+        if (sat_basis == gs_basis) {
+            measured = raw_bit;  // correct measurement
+        } else {
+            measured = static_cast<uint8_t>(esp_random() & 1);  // quantum collapse
+        }
+
+        if (measured) {
+            BIT_SET(s_measured_bits, i);
+        }
+    }
+
+    s_qkd_session_active = true;
+
+    // Send QKD_RESPONSE with satellite bases
+    ps_qkd_response_t resp = {};
+    memcpy(resp.sat_bases, s_sat_bases, 13);
+    resp.num_bits = num_bits;
+
+    enqueue_frame(PS_MSG_QKD_RESPONSE, (const uint8_t *)&resp, sizeof(resp));
+    ESP_LOGI(TAG, "QKD_RESPONSE sent");
+}
+
+static void handle_qkd_sifted(const ps_header_t *hdr, const uint8_t *payload)
+{
+    if (hdr->len < sizeof(ps_qkd_sifted_t)) {
+        ESP_LOGW(TAG, "QKD_SIFTED too short");
+        return;
+    }
+
+    if (!s_qkd_session_active) {
+        ESP_LOGW(TAG, "QKD_SIFTED received without active session");
+        return;
+    }
+
+    const ps_qkd_sifted_t *sifted = (const ps_qkd_sifted_t *)payload;
+    uint8_t num_bits = sifted->num_bits;
+    if (num_bits > 100) num_bits = 100;
+
+    ESP_LOGI(TAG, "QKD_SIFTED received: %u bits", num_bits);
+
+    // Compare check bits and extract final key
+    uint8_t error_count = 0;
+    uint8_t check_count = 0;
+    uint8_t key_bits[16];  // max 100 key bits = 13 bytes, but use 16 for safety
+    memset(key_bits, 0, sizeof(key_bits));
+    int key_bit_count = 0;
+
+    for (int i = 0; i < num_bits; i++) {
+        uint8_t match = BIT_GET(sifted->match_mask, i);
+        uint8_t check = BIT_GET(sifted->check_mask, i);
+
+        if (match && check) {
+            // Check bit — compare for errors
+            check_count++;
+            uint8_t gs_bit  = BIT_GET(sifted->check_bits, i);
+            uint8_t sat_bit = BIT_GET(s_measured_bits, i);
+            if (gs_bit != sat_bit) {
+                error_count++;
+            }
+        } else if (match && !check) {
+            // Key bit — extract into key
+            if (BIT_GET(s_measured_bits, i)) {
+                BIT_SET(key_bits, key_bit_count);
+            }
+            key_bit_count++;
+        }
+    }
+
+    ESP_LOGI(TAG, "QKD: checked=%u errors=%u key_bits=%d", check_count, error_count, key_bit_count);
+
+    // Build key byte array from key_bits
+    int key_len = (key_bit_count + 7) / 8;
+    uint8_t key_bytes[16];
+    memset(key_bytes, 0, sizeof(key_bytes));
+    for (int i = 0; i < key_bit_count; i++) {
+        if (BIT_GET(key_bits, i)) {
+            BIT_SET(key_bytes, i);
+        }
+    }
+
+    // XOR-encrypt the proof message
+    ps_qkd_verify_t verify = {};
+    verify.error_count  = error_count;
+    verify.check_count  = check_count;
+    verify.key_len_bits = static_cast<uint8_t>(key_bit_count);
+
+    size_t msg_len = strlen(QKD_PROOF_MESSAGE);
+    if (msg_len > QKD_PROOF_MSG_MAX) msg_len = QKD_PROOF_MSG_MAX;
+
+    if (key_len > 0) {
+        for (size_t i = 0; i < msg_len; i++) {
+            verify.encrypted_msg[i] = static_cast<uint8_t>(
+                QKD_PROOF_MESSAGE[i] ^ key_bytes[i % key_len]);
+        }
+    } else {
+        memcpy(verify.encrypted_msg, QKD_PROOF_MESSAGE, msg_len);
+    }
+
+    verify.encrypted_len = static_cast<uint8_t>(msg_len);
+    verify.status = (error_count > 0) ? 1 : 0;
+
+    s_qkd_session_active = false;
+
+    enqueue_frame(PS_MSG_QKD_VERIFY, (const uint8_t *)&verify, sizeof(verify));
+    ESP_LOGI(TAG, "QKD_VERIFY sent: status=%u key_bits=%u", verify.status, verify.key_len_bits);
+}
+
 static void lora_rx_task(void *arg)
 {
     e22_start_rx();
@@ -309,6 +456,10 @@ static void lora_rx_task(void *arg)
                 if (ps_parser_feed(&parser, rx_buf[i], &hdr, payload_buf, sizeof(payload_buf))) {
                     if (hdr.msg_type == PS_MSG_CMD) {
                         handle_command(&hdr, payload_buf);
+                    } else if (hdr.msg_type == PS_MSG_QKD_INITIATE) {
+                        handle_qkd_initiate(&hdr, payload_buf);
+                    } else if (hdr.msg_type == PS_MSG_QKD_SIFTED) {
+                        handle_qkd_sifted(&hdr, payload_buf);
                     }
                 }
             }

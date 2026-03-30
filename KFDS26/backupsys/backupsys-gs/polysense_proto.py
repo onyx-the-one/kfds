@@ -1,7 +1,8 @@
 from __future__ import annotations
+import os
 import struct
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union, Iterator
+from typing import Optional, Tuple, Union, Iterator, List
 
 PS_SYNC_LO = 0x55
 PS_SYNC_HI = 0xAA
@@ -15,6 +16,13 @@ PS_MSG_STATUS     = 0x04
 PS_MSG_BEACON     = 0x05
 PS_MSG_CMD        = 0x10
 PS_MSG_CMD_ACK    = 0x11
+
+PS_MSG_QKD_INITIATE = 0x20
+PS_MSG_QKD_RESPONSE = 0x21
+PS_MSG_QKD_SIFTED   = 0x22
+PS_MSG_QKD_VERIFY   = 0x23
+
+QKD_PROOF_MSG_MAX = 32
 
 # Command classes
 PS_CMD_CLASS_RECOVERY = 0
@@ -140,11 +148,43 @@ class CmdAck:
 
 
 @dataclass
+class QkdInitiate:
+    raw_bits: bytes   # 13 bytes, 100 bits packed MSB first
+    gs_bases: bytes   # 13 bytes
+    num_bits: int     # = 100
+
+
+@dataclass
+class QkdResponse:
+    sat_bases: bytes  # 13 bytes
+    num_bits: int     # = 100
+
+
+@dataclass
+class QkdSifted:
+    match_mask: bytes  # 13 bytes
+    check_mask: bytes  # 13 bytes
+    check_bits: bytes  # 13 bytes
+    num_bits: int      # = 100
+
+
+@dataclass
+class QkdVerify:
+    error_count: int
+    check_count: int
+    key_len_bits: int
+    encrypted_msg: bytes
+    encrypted_len: int
+    status: int
+
+
+@dataclass
 class Frame:
     ver: int
     msg_type: int
     node_id: int
-    payload: Union[EnvTelem, ImuTelem, GpsTelem, Status, Beacon, CmdHeader, CmdAck, bytes]
+    payload: Union[EnvTelem, ImuTelem, GpsTelem, Status, Beacon, CmdHeader, CmdAck,
+                   QkdInitiate, QkdResponse, QkdSifted, QkdVerify, bytes]
 
 
 # -------------------------
@@ -202,6 +242,48 @@ def encode_cmd(node_id: int, h: CmdHeader) -> bytes:
     hdr = struct.pack("<HBBH", h.cmd_id, h.cmd_class, h.cmd_code, len(h.params))
     payload = hdr + (h.params or b"")
     return build_frame(node_id, PS_MSG_CMD, payload)
+
+
+# -------------------------
+# Bit packing helpers
+# -------------------------
+
+def bit_get(arr: bytes, i: int) -> int:
+    return (arr[i // 8] >> (7 - (i % 8))) & 1
+
+
+def bit_set(arr: bytearray, i: int) -> None:
+    arr[i // 8] |= (0x80 >> (i % 8))
+
+
+def pack_bits(bit_list: List[int]) -> bytes:
+    n_bytes = (len(bit_list) + 7) // 8
+    buf = bytearray(n_bytes)
+    for i, b in enumerate(bit_list):
+        if b:
+            bit_set(buf, i)
+    return bytes(buf)
+
+
+def unpack_bits(data: bytes, count: int) -> List[int]:
+    return [bit_get(data, i) for i in range(count)]
+
+
+# -------------------------
+# QKD encode helpers
+# -------------------------
+
+def encode_qkd_initiate(node_id: int, raw_bits: bytes, gs_bases: bytes,
+                        num_bits: int = 100) -> bytes:
+    payload = raw_bits[:13] + gs_bases[:13] + struct.pack("B", num_bits)
+    return build_frame(node_id, PS_MSG_QKD_INITIATE, payload)
+
+
+def encode_qkd_sifted(node_id: int, match_mask: bytes, check_mask: bytes,
+                       check_bits: bytes, num_bits: int = 100) -> bytes:
+    payload = (match_mask[:13] + check_mask[:13] + check_bits[:13] +
+               struct.pack("B", num_bits))
+    return build_frame(node_id, PS_MSG_QKD_SIFTED, payload)
 
 
 # -------------------------
@@ -284,7 +366,35 @@ def _decode_cmd_ack(payload: bytes) -> CmdAck:
     return CmdAck(cmd_id, status, detail, ts)
 
 
-def decode_payload(msg_type: int, payload: bytes) -> Union[EnvTelem, ImuTelem, GpsTelem, Status, Beacon, CmdHeader, CmdAck, bytes]:
+def _decode_qkd_response(payload: bytes) -> QkdResponse:
+    if len(payload) < 14:
+        raise ValueError("QKD_RESPONSE too short")
+    sat_bases = payload[:13]
+    num_bits = payload[13]
+    return QkdResponse(sat_bases=sat_bases, num_bits=num_bits)
+
+
+def _decode_qkd_verify(payload: bytes) -> QkdVerify:
+    # Packed struct: 1+1+1+32+1+1 = 37 bytes
+    if len(payload) < 37:
+        raise ValueError("QKD_VERIFY too short")
+    error_count = payload[0]
+    check_count = payload[1]
+    key_len_bits = payload[2]
+    encrypted_msg = payload[3:35]     # 32 bytes
+    encrypted_len = payload[35]
+    status = payload[36]
+    return QkdVerify(
+        error_count=error_count,
+        check_count=check_count,
+        key_len_bits=key_len_bits,
+        encrypted_msg=bytes(encrypted_msg[:encrypted_len]),
+        encrypted_len=encrypted_len,
+        status=status,
+    )
+
+
+def decode_payload(msg_type: int, payload: bytes) -> Union[EnvTelem, ImuTelem, GpsTelem, Status, Beacon, CmdHeader, CmdAck, QkdResponse, QkdVerify, bytes]:
     if msg_type == PS_MSG_ENV_TELEM:
         return _decode_env(payload)
     if msg_type == PS_MSG_IMU_TELEM:
@@ -299,6 +409,10 @@ def decode_payload(msg_type: int, payload: bytes) -> Union[EnvTelem, ImuTelem, G
         return _decode_cmd(payload)
     if msg_type == PS_MSG_CMD_ACK:
         return _decode_cmd_ack(payload)
+    if msg_type == PS_MSG_QKD_RESPONSE:
+        return _decode_qkd_response(payload)
+    if msg_type == PS_MSG_QKD_VERIFY:
+        return _decode_qkd_verify(payload)
     return payload  # raw bytes for unknown types
 
 
