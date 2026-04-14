@@ -139,3 +139,4 @@ tools/idf.py  # symlink
 # OS
 .DS_Store
 Thumbs.db
+.aider*
