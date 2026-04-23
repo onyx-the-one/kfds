@@ -5,27 +5,27 @@
 
 // ── Shared SPI Bus (SPI2_HOST) ──────────────────────────────────────────
 #define POLYSENSE_SPI_HOST    SPI2_HOST
-#define PIN_SPI_MOSI          GPIO_NUM_11
-#define PIN_SPI_MISO          GPIO_NUM_13
-#define PIN_SPI_SCLK          GPIO_NUM_12
+#define PIN_SPI_MOSI          GPIO_NUM_23
+#define PIN_SPI_MISO          GPIO_NUM_19
+#define PIN_SPI_SCLK          GPIO_NUM_18
 
 // ── Chip Select Lines (active low) ─────────────────────────────────────
-#define PIN_CS_IMU            GPIO_NUM_10   // ICM-42688-P
-#define PIN_CS_ENV            GPIO_NUM_9    // BME688
-#define PIN_CS_LORA           GPIO_NUM_14   // E22-900M22S (NSS)
-#define PIN_CS_GPS            GPIO_NUM_15   // NEO-M9N
+#define PIN_CS_IMU            GPIO_NUM_5    // ICM-42688-P
+#define PIN_CS_ENV            GPIO_NUM_17   // BME688
+#define PIN_CS_LORA           GPIO_NUM_25   // E22-900M22S (NSS)
+#define PIN_CS_GPS            GPIO_NUM_26   // NEO-M9N
 
-// ── ICM-42688-P Interrupts ─────────────────────────────────────────────
-#define PIN_IMU_INT1          GPIO_NUM_4
-#define PIN_IMU_INT2          GPIO_NUM_5
+// ── ICM-42688-P Interrupts (input-only GPIOs fine here) ────────────────
+#define PIN_IMU_INT1          GPIO_NUM_34
+#define PIN_IMU_INT2          GPIO_NUM_35
 
 // ── NEO-M9N Control ────────────────────────────────────────────────────
-#define PIN_GPS_EXTINT        GPIO_NUM_6
+#define PIN_GPS_EXTINT        GPIO_NUM_32
 
 // ── E22-900M22S Control ────────────────────────────────────────────────
-#define PIN_LORA_BUSY         GPIO_NUM_7
-#define PIN_LORA_DIO1         GPIO_NUM_8
-#define PIN_LORA_RST          GPIO_NUM_16
+#define PIN_LORA_BUSY         GPIO_NUM_27
+#define PIN_LORA_DIO1         GPIO_NUM_33
+#define PIN_LORA_RST          GPIO_NUM_16   // unchanged
 
 // ── SPI Clock Speeds ───────────────────────────────────────────────────
 #define SPI_CLK_IMU           1000000   // ICM-42688-P: 1 MHz (supports up to 24 MHz)
