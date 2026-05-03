@@ -517,6 +517,11 @@ extern "C" void app_main(void)
         return;
     }
 
+    gpio_set_pull_mode(PIN_CS_IMU,  GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(PIN_CS_ENV,  GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(PIN_CS_LORA, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(PIN_CS_GPS,  GPIO_PULLUP_ONLY);
+
     // Initialize shared SPI bus (SPI2_HOST) — all 4 devices share this bus
     spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = PIN_SPI_MOSI;
@@ -529,6 +534,30 @@ extern "C" void app_main(void)
 
     ESP_LOGI(TAG, "Initializing shared SPI bus (SPI2_HOST)...");
     ESP_ERROR_CHECK(spi_bus_initialize(POLYSENSE_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+
+    {
+        spi_device_handle_t loopback;
+        spi_device_interface_config_t lb_cfg = {};
+        lb_cfg.clock_speed_hz = 1000000;
+        lb_cfg.mode           = 0;
+        lb_cfg.spics_io_num   = -1;   // no CS needed
+        lb_cfg.queue_size     = 1;
+        spi_bus_add_device(SPI2_HOST, &lb_cfg, &loopback);
+
+        uint8_t tx_data[] = {0xA5, 0x5A, 0xFF, 0x00};
+        uint8_t rx_data[4] = {};
+        spi_transaction_t t = {};
+        t.length    = 32;
+        t.tx_buffer = tx_data;
+        t.rx_buffer = rx_data;
+        spi_device_transmit(loopback, &t);
+
+        ESP_LOGI("LOOPBACK", "TX: %02X %02X %02X %02X", tx_data[0], tx_data[1], tx_data[2], tx_data[3]);
+        ESP_LOGI("LOOPBACK", "RX: %02X %02X %02X %02X", rx_data[0], rx_data[1], rx_data[2], rx_data[3]);
+
+        spi_bus_remove_device(loopback);
+    }
+
 
     // Initialize drivers — each adds itself to the shared bus
     ESP_LOGI(TAG, "Initializing BME688...");

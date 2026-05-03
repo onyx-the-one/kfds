@@ -1,6 +1,7 @@
 #include "e22_lora.h"
 #include "node_config.h"
 
+#include "esp_attr.h"
 #include <cstring>
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
@@ -64,6 +65,8 @@ static const char *TAG = "E22_LORA";
 // SPI handle and state
 // -----------------------------------------------------------------------------
 static spi_device_handle_t s_spi = nullptr;
+static DMA_ATTR uint8_t s_tx[256];
+static DMA_ATTR uint8_t s_rx[256];
 static e22_link_quality_t  s_last_lq = {};
 
 // -----------------------------------------------------------------------------
@@ -85,20 +88,20 @@ static esp_err_t sx_cmd(const uint8_t *cmd, size_t cmd_len,
     wait_busy();
 
     size_t total = cmd_len + resp_len;
-    uint8_t tx[total];
-    uint8_t rx[total];
-    memset(tx, 0x00, total);
-    memset(rx, 0x00, total);
-    memcpy(tx, cmd, cmd_len);
+    if (total > sizeof(s_tx)) return ESP_ERR_INVALID_SIZE;
+
+    memset(s_tx, 0x00, total);
+    memset(s_rx, 0x00, total);
+    memcpy(s_tx, cmd, cmd_len);
 
     spi_transaction_t t = {};
-    t.length = total * 8;
-    t.tx_buffer = tx;
-    t.rx_buffer = rx;
+    t.length    = total * 8;
+    t.tx_buffer = s_tx;
+    t.rx_buffer = s_rx;
 
     esp_err_t err = spi_device_transmit(s_spi, &t);
     if (err == ESP_OK && resp && resp_len > 0) {
-        memcpy(resp, rx + cmd_len, resp_len);
+        memcpy(resp, s_rx + cmd_len, resp_len);
     }
     return err;
 }

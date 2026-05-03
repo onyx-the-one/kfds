@@ -1,6 +1,7 @@
 #include "bme688.h"
 #include "node_config.h"
 
+#include "esp_attr.h"
 #include <cstring>
 #include <cmath>
 #include "driver/spi_master.h"
@@ -49,6 +50,8 @@ static const char *TAG = "BME688";
 // SPI handle
 // -----------------------------------------------------------------------------
 static spi_device_handle_t s_spi = nullptr;
+static DMA_ATTR uint8_t s_tx[32];
+static DMA_ATTR uint8_t s_rx[32];
 
 // -----------------------------------------------------------------------------
 // SPI helpers — BME688 SPI protocol:
@@ -57,45 +60,50 @@ static spi_device_handle_t s_spi = nullptr;
 // -----------------------------------------------------------------------------
 static esp_err_t spi_write_reg(uint8_t reg, uint8_t val)
 {
-    uint8_t tx[2] = { static_cast<uint8_t>(reg & 0x7F), val };
+    memset(s_tx, 0, sizeof(s_tx));
+    s_tx[0] = static_cast<uint8_t>(reg & 0x7F);
+    s_tx[1] = val;
     spi_transaction_t t = {};
     t.length = 16;
-    t.tx_buffer = tx;
+    t.tx_buffer = s_tx;
+    t.rx_buffer = nullptr;
     return spi_device_transmit(s_spi, &t);
 }
 
 static esp_err_t spi_read_reg(uint8_t reg, uint8_t *val)
 {
-    uint8_t tx[2] = { static_cast<uint8_t>(reg | 0x80), 0x00 };
-    uint8_t rx[2] = {};
+    memset(s_tx, 0, sizeof(s_tx));
+    memset(s_rx, 0, sizeof(s_rx));
+    s_tx[0] = static_cast<uint8_t>(reg | 0x80);
+    s_tx[1] = 0x00;
     spi_transaction_t t = {};
     t.length = 16;
-    t.tx_buffer = tx;
-    t.rx_buffer = rx;
+    t.tx_buffer = s_tx;
+    t.rx_buffer = s_rx;
     esp_err_t err = spi_device_transmit(s_spi, &t);
-    if (err == ESP_OK) *val = rx[1];
+    if (err == ESP_OK) *val = s_rx[1];
     return err;
 }
 
 static esp_err_t spi_read_buf(uint8_t reg, uint8_t *buf, size_t len)
 {
-    uint8_t tx[1 + len];
-    memset(tx, 0, sizeof(tx));
-    tx[0] = static_cast<uint8_t>(reg | 0x80);
-
-    uint8_t rx[1 + len];
-    memset(rx, 0, sizeof(rx));
-
+    if (len + 1 > sizeof(s_tx)) return ESP_ERR_INVALID_SIZE;
+    memset(s_tx, 0, sizeof(s_tx));
+    memset(s_rx, 0, sizeof(s_rx));
+    s_tx[0] = static_cast<uint8_t>(reg | 0x80);
     spi_transaction_t t = {};
     t.length = (1 + len) * 8;
-    t.tx_buffer = tx;
-    t.rx_buffer = rx;
-
+    t.tx_buffer = s_tx;
+    t.rx_buffer = s_rx;
     esp_err_t err = spi_device_transmit(s_spi, &t);
-    if (err == ESP_OK) {
-        memcpy(buf, rx + 1, len);
-    }
+    if (err == ESP_OK) memcpy(buf, s_rx + 1, len);
     return err;
+}
+static void set_spi_mem_page(uint8_t page)
+{
+    // Register 0x73, bit 4 = spi_mem_page
+    uint8_t val = (page & 0x01) << 4;
+    spi_write_reg(0x73 & 0x7F, val);
 }
 
 // -----------------------------------------------------------------------------
@@ -293,12 +301,14 @@ static uint8_t calc_res_heat(uint16_t target_temp_c)
 
 esp_err_t bme688_init(spi_host_device_t host)
 {
-    // Add BME688 to the shared SPI bus — Mode 0 (CPOL=0, CPHA=0)
     spi_device_interface_config_t dev_cfg = {};
-    dev_cfg.clock_speed_hz = SPI_CLK_ENV;
-    dev_cfg.mode = 0;
-    dev_cfg.spics_io_num = PIN_CS_ENV;
-    dev_cfg.queue_size = 4;
+    dev_cfg.clock_speed_hz  = SPI_CLK_ENV;
+    dev_cfg.mode            = 0;
+    dev_cfg.spics_io_num    = PIN_CS_ENV;
+    dev_cfg.queue_size      = 4;
+    dev_cfg.cs_ena_pretrans = 2;       // 2 SPI cycles CS setup before clock
+    dev_cfg.cs_ena_posttrans = 2;      // 2 SPI cycles CS hold after clock
+    dev_cfg.input_delay_ns  = 50;      // compensate for breadboard wire delay on MISO
 
     esp_err_t err = spi_bus_add_device(host, &dev_cfg, &s_spi);
     if (err != ESP_OK) {
@@ -308,6 +318,10 @@ esp_err_t bme688_init(spi_host_device_t host)
 
     vTaskDelay(pdMS_TO_TICKS(10));
 
+    // Switch to page 1 to access 0xD0 and above
+    set_spi_mem_page(1);
+    vTaskDelay(pdMS_TO_TICKS(2));
+
     // Read and verify chip ID
     uint8_t chip_id = 0;
     err = spi_read_reg(REG_CHIP_ID, &chip_id);
@@ -316,6 +330,8 @@ esp_err_t bme688_init(spi_host_device_t host)
         return ESP_ERR_NOT_FOUND;
     }
     ESP_LOGI(TAG, "BME688 detected (chip_id=0x%02X)", chip_id);
+
+    set_spi_mem_page(0);
 
     // Soft reset
     spi_write_reg(REG_RESET, 0xB6);

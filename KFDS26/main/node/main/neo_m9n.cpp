@@ -1,6 +1,7 @@
 #include "neo_m9n.h"
 #include "node_config.h"
 
+#include "esp_attr.h"
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
@@ -28,6 +29,9 @@ static SemaphoreHandle_t s_fix_mutex;
 // NMEA sentence accumulator
 static char s_nmea_buf[NMEA_MAX_LEN];
 static int  s_nmea_pos;
+
+static DMA_ATTR uint8_t s_gps_tx[SPI_POLL_SIZE];
+static DMA_ATTR uint8_t s_gps_rx[SPI_POLL_SIZE];
 
 // -----------------------------------------------------------------------------
 // NMEA checksum validation
@@ -266,15 +270,13 @@ static void feed_byte(uint8_t byte)
 // -----------------------------------------------------------------------------
 static void gnss_spi_task(void *arg)
 {
-    uint8_t tx_buf[SPI_POLL_SIZE];
-    uint8_t rx_buf[SPI_POLL_SIZE];
-    memset(tx_buf, 0xFF, sizeof(tx_buf));
+    memset(s_gps_tx, 0xFF, sizeof(s_gps_tx));
 
     while (true) {
         spi_transaction_t t = {};
-        t.length = SPI_POLL_SIZE * 8;
-        t.tx_buffer = tx_buf;
-        t.rx_buffer = rx_buf;
+        t.length    = SPI_POLL_SIZE * 8;
+        t.tx_buffer = s_gps_tx;
+        t.rx_buffer = s_gps_rx;
 
         esp_err_t err = spi_device_transmit(s_spi, &t);
         if (err != ESP_OK) {
@@ -282,11 +284,10 @@ static void gnss_spi_task(void *arg)
             continue;
         }
 
-        // Feed received bytes into NMEA parser, skipping 0xFF filler
         bool got_data = false;
         for (int i = 0; i < SPI_POLL_SIZE; i++) {
-            if (rx_buf[i] != 0xFF) {
-                feed_byte(rx_buf[i]);
+            if (s_gps_rx[i] != 0xFF) {
+                feed_byte(s_gps_rx[i]);
                 got_data = true;
             }
         }
