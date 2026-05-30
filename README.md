@@ -1,3 +1,4 @@
+[![CodeFactor](https://www.codefactor.io/repository/github/onyx-the-one/kfds/badge/master)](https://www.codefactor.io/repository/github/onyx-the-one/kfds/overview/master)
 # KFDS Software Repository
 
 KFDS (KFDS25, KFDS26, and future versions) is the software for a next-generation CanSat platform that transforms into a semiautonomous rover post-landing. It features modular payloads, dual-redundant LoRa communications, rich environmental telemetry, and autonomous wheel deployment via nitinol actuators.
